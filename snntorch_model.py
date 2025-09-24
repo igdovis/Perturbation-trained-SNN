@@ -17,17 +17,17 @@ nb_time_steps = 100
 nb_inputs = 20
 nb_classes = 10
 
-ds_train, ds_valid, ds_test = generate_randman(plot=False)  # returns tensors/arrays shaped (B,T,I) + labels
-train_loader = torch.utils.data.DataLoader(ds_train, batch_size=32, shuffle=True, drop_last=True)
+ds_train, ds_valid, ds_test = generate_randman(dim_manifold=1, nb_classes=nb_classes, plot=False)  
+train_loader = torch.utils.data.DataLoader(ds_train, batch_size=64, shuffle=True, drop_last=True)
 valid_loader = torch.utils.data.DataLoader(ds_valid, batch_size=512, shuffle=False)
 test_loader  = torch.utils.data.DataLoader(ds_test,  batch_size=512, shuffle=False)
 
 class SimpleSNN(nn.Module):
-    "Simple SNN: Linear -> LIF -> Linear"
-    def __init__(self, in_dim=20, hidden=128, nclass=10, beta=0.95):
+    "Linear -> LIF -> Linear"
+    def __init__(self, in_dim=20, hidden=128, nclass=10, beta=0.90):
         super().__init__()
         self.fc1  = nn.Linear(in_dim, hidden, bias=True)
-        self.lif1 = snn.Leaky(beta=beta, threshold=0.5, reset_mechanism='subtract') 
+        self.lif1 = snn.Leaky(beta=beta, threshold=0.15, reset_mechanism='subtract') 
         self.fc2  = nn.Linear(hidden, nclass, bias=True)
         with torch.no_grad():
             nn.init.kaiming_normal_(self.fc1.weight, nonlinearity='linear')
@@ -36,38 +36,49 @@ class SimpleSNN(nn.Module):
             nn.init.kaiming_normal_(self.fc2.weight, nonlinearity='linear')
             self.fc2.bias.zero_()
     @torch.no_grad()
-    def forward_logits(self, x):
+    def forward_logits(self, x, return_diagnostics=False):
         B, T, D = x.shape
         x = x.to(device=device, dtype=torch.float32)
-        # init state
+        x = 2.0 * x  # input scaling, doesnt seem to work anyways
         mem1 = self.lif1.reset_mem()
         logits_acc = torch.zeros(B, nb_classes, device=device, dtype=torch.float32)
-
-        # unroll through time
+        spike_counts = torch.zeros(B, self.fc1.out_features, device=device)
+        spike_sum = 0.0
+        vmin, vmax = 0.0, 0.0
         for t in range(T):
-            cur = x[:, t, :]                       # (B, I)
-            h    = self.fc1(cur)                   # (B, hidden)
-            spk, mem1 = self.lif1(h, mem1)        # (B, hidden), (B, hidden)
-            logits_t = self.fc2(spk)              # (B, C)
+            cur = x[:, t, :]                       
+            h = self.fc1(cur)                   
+            spk, mem1 = self.lif1(h, mem1)        
+            logits_t = self.fc2(spk)             
             logits_acc.add_(logits_t)
-
+            spike_sum += spk.sum().item()
+            vmin = min(vmin, mem1.min().item())
+            vmax = max(vmax, mem1.max().item())
         # reduction over time
-        logits = logits_acc / T                   # (B, C)
-        return logits
+        logits = logits_acc / T 
+        if not return_diagnostics:
+            return logits
+        avg_spk = spike_sum / (B * T * self.fc1.out_features + 1e-8)
+        diagnostics = {'avg_spk': avg_spk, 'mem_min': vmin, 'mem_max': vmax}
+        return logits, diagnostics
     
 model = SimpleSNN(in_dim=nb_inputs, hidden=128, nclass=nb_classes, beta=0.95).to(device)
 for p in model.parameters():
     p.requires_grad_(False)
     
 @torch.no_grad()
-def batch_error_CE(m, xb, yb):
-    xb = torch.as_tensor(xb, device=device, dtype=torch.float32)        # (B,T,I)
+def batch_error_CE(m, xb, yb, return_diagnostics=False):
+    xb = torch.as_tensor(xb, device=device, dtype=torch.float32) # (B,T,I)
     yb = torch.as_tensor(yb, device=device)
     if yb.dtype != torch.long:
         yb = (yb.argmax(dim=-1) if yb.ndim > 1 else yb).long()
-    logits = m.forward_logits(xb)                                       # (B,C)
+    out = m.forward_logits(xb, return_diagnostics)     
+    if return_diagnostics:
+        logits, diagnostics = out
+    else:
+        logits = out
     loss = F.cross_entropy(logits, yb)
-    return float(loss.item())
+    return (float(loss.item()), diagnostics) if return_diagnostics else float(loss.item())
 
 @torch.no_grad()
 def loader_accuracy(m, loader):
@@ -98,63 +109,53 @@ def normalize_to_unit(noise_list):
 def add_scaled_params(m, direction_list, scale):
     """θ <- θ + scale * direction."""
     for p, d in zip(m.parameters(), direction_list):
-        p.add_(scale * d)
-        
+        p.add_(scale * d)        
+
 #### training
 
-h     = 0.5     # finite-difference step size
-eta   = 0.05      # learning rate along u
+h = 0.5
+eta = 0.08
 epochs = 30
-K_dirs = 1      # number of random directions to average each batch (variance reduction????)
 weight_decay = 0 
 
 with torch.no_grad():
-    for epoch in range(1, epochs + 1):
-        for bidx, (xb, yb) in enumerate(train_loader):
-            # Average Du over K random directions
-            Du_accum = 0.0
-            u_accum  = [torch.zeros_like(p) for p in model.parameters()]
+    for epoch in range(1, epochs+1):
+        step = 0
+        Du_running, spk_running = 0.0, 0.0
+        for xb, yb in train_loader: 
+            E_base, diag = batch_error_CE(model, xb, yb, return_diagnostics=True)
 
-            for k in range(K_dirs):
-                noise = sample_noise_like_params(model)
-                u, _  = normalize_to_unit(noise)
+            noise = sample_noise_like_params(model)
+            v, _  = normalize_to_unit(noise) 
 
-                # central difference without deepcopy:
-                # θ+ = θ + h u
-                add_scaled_params(model, u, +h)
-                E_plus  = batch_error_CE(model, xb, yb)
-                # θ- = θ - h u  (from θ+ we subtract 2h u)
-                add_scaled_params(model, u, -2*h)
-                E_minus = batch_error_CE(model, xb, yb)
-                # restore θ (add back h u)
-                add_scaled_params(model, u, +h)
-
-                Du_k = (E_plus - E_minus) / (2*h)
-                Du_accum += Du_k
-                for ua, ui in zip(u_accum, u):
-                    ua.add_(ui)
-
-            Du = Du_accum / K_dirs
-            u  = [ua / K_dirs for ua in u_accum]
-
-            # update θ ← θ − η Du u
-            step = -eta * Du
-            add_scaled_params(model, u, step)
-
-            # optional weight decay tied to η (L2-style)
+            add_scaled_params(model, v, +h)
+            E_pert = batch_error_CE(model, xb, yb)
+            add_scaled_params(model, v, -h)   # restore params
+            
+            Du = (E_pert - E_base) / h 
+            for p, vi in zip(model.parameters(), v):
+                p.add_(-eta * Du * vi)
+            Du_running += Du
+            spk_running += diag['avg_spk']
+            step += 1
             if weight_decay > 0:
                 decay = 1 - eta * weight_decay
                 for p in model.parameters():
                     p.mul_(decay)
-
-            # print a quick diagnostic once
-            if epoch == 1 and bidx == 0:
-                print(f"[dbg] E+={E_plus:.4f} E-={E_minus:.4f} Du={Du:.6f} step={step:.6f}")
-
+                    
+            if step % 20 == 0:
+                print(
+                    f"step {step:04d} "
+                    f"E_base {E_base:.3f} -> E_pert {E_pert:.3f} | "
+                    f"Du {Du:+.2e} | spk {diag['avg_spk']:.2e} | "
+                    f"V[{diag['mem_min']:.2f},{diag['mem_max']:.2f}]"
+                )
         # epoch metrics
         train_acc = loader_accuracy(model, train_loader)
         val_acc   = loader_accuracy(model, valid_loader)
-        print(f"epoch {epoch:03d} | acc(train) {train_acc:.3f} | acc(val) {val_acc:.3f}")
+        print(f"epoch {epoch:03d} | acc(train) {train_acc:.3f} | acc(val) {val_acc:.3f} | "
+            f"Du(avg) {Du_running/step:+.2e} | spk(avg) {spk_running/step:.2e}")
+        
 
 test_acc = loader_accuracy(model, test_loader)
 print("test acc:", round(test_acc * 100, 2), "%")
