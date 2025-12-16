@@ -19,12 +19,22 @@ import re
 import stork.datasets as datasets
 import snntorch as snn
 from snntorch import surrogate
+from snntorch.spikevision import spikedata
 import wandb
+# importing shd dataset
+import tonic
+import tonic.transforms as ttf
+# transform shd event data to tensor format
+from torchvision import transforms as tvt
 
 # TODO clean this up
 def parse_args():
     parser = argparse.ArgumentParser(
         description='SNN WP vs SGD depth cosine experiment for Randman dataset')
+    
+    # Dataset selection
+    parser.add_argument('--dataset', type=str, default='randman', 
+                        choices=['randman', 'shd'], help='Dataset to use')
     
     # Experiment parameters
     parser.add_argument('--depth_min', type=int, default=1, help='Minimum network depth')
@@ -37,12 +47,14 @@ def parse_args():
     parser.add_argument('--hidden', type=int, default=128, help='Hidden layer size')
     parser.add_argument('--beta', type=float, default=0.95, help='Leaky integrate factor')
     parser.add_argument('--threshold', type=float, default=1.0, help='Spike threshold')
-    parser.add_argument('--eq31', action='store_false', help='Use eq31 initialization')
-    
+    parser.add_argument('--eq31', action='store_true', help='Use eq31 initialization')
+    parser.add_argument('--include_bias', action='store_true', help='include bias parameters in WP–SGD comparison (default: exclude)')
     # Dataset parameters
+    parser.add_argument('--data_dir', type=str, default='data', help='Data directory')
     parser.add_argument('--nb_samples', type=int, default=1000, help='Number of samples')
     parser.add_argument('--batch_size', type=int, default=8, help='Training batch size')
-    
+    parser.add_argument('--num_steps', type=int, default=100, help='Number of time steps (shd)')
+    parser.add_argument('--dt', type=float, default=1000, help='dt in microseconds (shd)')
     # Output parameters
     parser.add_argument('--output_dir', type=str, default='results', help='Output directory')
     parser.add_argument('--experiment_name', type=str, default=None, 
@@ -52,7 +64,7 @@ def parse_args():
     parser.add_argument('--device', type=str, default='auto', 
                         choices=['auto', 'cpu', 'cuda'], help='Device to use')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
-    
+    parser.add_argument('--include_bias', action='store_true', help='include bias parameters in WP–SGD comparison (default: exclude)')
     return parser.parse_args()
 
 
@@ -94,6 +106,68 @@ def generate_randman(
         for ds in datasets_split
     ]
     return datasets_ras
+
+def load_shd_dataset(args):
+    """Load Spiking Heidelberg Digits dataset via tonic and return [train, valid, test], input_dim, output_dim.
+    Each sample: x shape (T, 700), y in [0..19].
+    """
+    print("Loading SHD dataset via tonic .. . . . ..")
+
+    # Where tonic stores/creates shd_train.h5, shd_test.h5
+    save_to = os.path.join(args.data_dir, "shd")
+
+    # (W, H, P) – for SHD this is typically (700, 1, 1)
+    sensor_size = tonic.datasets.SHD.sensor_size
+    input_dim = sensor_size[0] * sensor_size[1] * sensor_size[2] 
+    output_dim = 20  # SHD has 20 classes
+
+    # Transform: events -> frames -> torch tensor -> (T, input_dim)
+    event_transform = ttf.Compose([
+        ttf.ToFrame(sensor_size=sensor_size, n_time_bins=args.num_steps),
+        tvt.Lambda(
+            lambda frames: torch.from_numpy(frames).float()
+                            .view(frames.shape[0], -1)  # (T, input_dim)
+        ),
+    ])
+    print("input dim:", input_dim, "output dim:", output_dim)
+    # tonic will download the dataset the first time, if needed
+    train_ds = tonic.datasets.SHD(
+        save_to=save_to,
+        train=True,
+        transform=event_transform,
+        target_transform=None,
+    )
+    test_full = tonic.datasets.SHD(
+        save_to=save_to,
+        train=False,
+        transform=event_transform,
+        target_transform=None,
+    )
+
+    # Split test into validation + test (like you did before)
+    test_size = len(test_full)
+    valid_size = test_size // 2
+    test_size  = test_size - valid_size
+
+    valid_ds, test_ds = torch.utils.data.random_split(
+        test_full,
+        [valid_size, test_size],
+        generator=torch.Generator().manual_seed(args.seed),
+    )
+
+    return [train_ds, valid_ds, test_ds], input_dim, output_dim
+
+def get_dataset(args):
+    """Get dataset based on args"""
+    if args.dataset == 'randman':
+        datasets_list = generate_randman()
+        input_dim = 20  
+        output_dim = 10  
+        return datasets_list, input_dim, output_dim
+    elif args.dataset == 'shd':
+        return load_shd_dataset(args)
+    else:
+        raise ValueError(f"Unknown dataset: {args.dataset}")
 
 def setup_experiment(args):
     """Setup directories, device, and logging"""
@@ -169,10 +243,10 @@ class SimpleSNN(nn.Module):
                 for fc in self.fcs:
                     nn.init.kaiming_normal_(fc.weight, nonlinearity="linear")
                     nn.init.zeros_(fc.bias)
-                    fc.bias.requires_grad_(False)
+                    fc.bias.requires_grad_(True)
                 nn.init.kaiming_normal_(self.fc_out.weight, nonlinearity="linear")
                 nn.init.zeros_(self.fc_out.bias)
-                self.fc_out.bias.requires_grad_(False)
+                self.fc_out.bias.requires_grad_(True)
 
     def forward_logits(self, x, record=False):
         B, T, _ = x.shape
@@ -310,8 +384,11 @@ def per_layer_cosines(dWP_dict, dSGD_dict):
     return weights_only, bias_only, combined
 
 # main function to compute cosine similarity using orthogonal perturbation
-def cosine_similarity_wp_sgd_orthogonal(model, xb, yb, h=0.01, include_layers=None):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def cosine_similarity_wp_sgd_orthogonal(model, xb, yb, h=0.01, include_layers=None, 
+                                        include_bias=True, device=None):
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
     print(device)
     model.wp.to(device)
     model.sgd.to(device)
@@ -325,6 +402,8 @@ def cosine_similarity_wp_sgd_orthogonal(model, xb, yb, h=0.01, include_layers=No
     named_sgd = list(model.sgd.named_parameters())
 
     def included(name):
+        if (not include_bias) and name.endswith(".bias"):
+            return False
         return (include_layers is None) or any(k in name for k in include_layers)
 
     with torch.no_grad():
@@ -411,7 +490,7 @@ def cosine_similarity_wp_sgd_orthogonal(model, xb, yb, h=0.01, include_layers=No
 
     return result
 
-def analyze_spiking_activity(model, loader, device, num_batches=5):
+def analyze_spiking_activity(model, loader, device, num_batches=4):
     """Analyze spiking activity across layers"""
     model.sgd.to(device)
     model.sgd.eval()
@@ -420,9 +499,14 @@ def analyze_spiking_activity(model, loader, device, num_batches=5):
     all_mem_stats = [[] for _ in range(model.sgd.depth)]
     
     with torch.no_grad():
-        for batch_idx, (xb, yb) in enumerate(loader):
+        for batch_idx, batch_data in enumerate(loader):
             if batch_idx >= num_batches:
                 break
+            
+            if isinstance(batch_data, (tuple, list)):
+                xb, yb = batch_data[0], batch_data[1]
+            else:
+                xb, yb = batch_data, None
             
             xb = xb.to(device)
             logits, traces = model.forward_sgd(xb, record=True)
@@ -684,7 +768,7 @@ def plot_spike_rates_vs_depth(all_spike_stats, output_dir):
                 dpi=150, bbox_inches='tight')
     plt.close()
     
-def run_experiment_for_depth(depth, args, loader, output_dir, device):
+def run_experiment_for_depth(depth, args, loader, output_dir, input_dim, output_dim, device):
     """Run the experiment for a single depth"""
     print(f"\n{'='*60}")
     print(f"Running experiment for depth = {depth}")
@@ -692,9 +776,9 @@ def run_experiment_for_depth(depth, args, loader, output_dir, device):
     
     # Create model
     model = DualSNN(
-        inDim=20, 
+        inDim=input_dim, 
         hidden=args.hidden, 
-        nClass=10, 
+        nClass=output_dim, 
         beta=args.beta, 
         thr_wp=args.threshold, 
         thr_sgd=args.threshold, 
@@ -703,17 +787,23 @@ def run_experiment_for_depth(depth, args, loader, output_dir, device):
     )
     # Run orthogonal noise 
     results = []
+    num_params = sum(p.numel() for p in model.wp.parameters())
     for h in args.h_values:
         print(f"Testing h={h} . . . . . .")
         it = iter(loader)
         
         for batch_idx in range(args.batches):
-            if batch_idx % 4 == 0:
-                print(f"    Batch {batch_idx}/{args.batches}")
+            print(f"    Batch {batch_idx}/{args.batches}")
             
-            xb, yb = next(it)
+            batch_data = next(it)
+            
+            if isinstance(batch_data, (tuple, list)):
+                xb, yb = batch_data[0], batch_data[1]
+            else:
+                xb, yb = batch_data, torch.zeros(xb.shape[0])
+                    
             result = cosine_similarity_wp_sgd_orthogonal(
-                model, xb, yb, h=h, include_layers=None
+                model, xb, yb, h=h, include_layers=None, device=device
             )
             result['h'] = h
             result['batch'] = batch_idx
@@ -746,25 +836,26 @@ def run_experiment_for_depth(depth, args, loader, output_dir, device):
 def main():
     args = parse_args()
     device, output_dir = setup_experiment(args)
-    
+
     print(f"Experiment: {args.experiment_name}")
+    print(f"Dataset: {args.dataset}")
     print(f"Output directory: {output_dir}")
     print(f"Depth range: {args.depth_min} to {args.depth_max}")
     print(f"h values: {args.h_values}")
-    
+    print(f"eq31 is {args.eq31}")
     # Generate dataset
     print("\nGenerating dataset...")
-    ds_train, ds_valid, ds_test = generate_randman(
-        dim_manifold=1,
-        nb_classes=10,
-        nb_samples=args.nb_samples
-    )
+    
+    datasets_list, input_dim, output_dim = get_dataset(args)
+    ds_train, ds_valid, ds_test = datasets_list
+    
     train_loader = torch.utils.data.DataLoader(
         ds_train, 
         batch_size=args.batch_size, 
         shuffle=True, 
-        drop_last=True
+        drop_last=True,
     )
+    
     print("intializing wandb")
     run = wandb.init(
         entity="igdovis-radboud-university",
@@ -780,7 +871,7 @@ def main():
     for depth in range(args.depth_min, args.depth_max + 1):
         run.log({"depth": depth})
         results, spike_stats = run_experiment_for_depth(
-            depth, args, train_loader, output_dir, device
+            depth, args, train_loader, output_dir, input_dim, output_dim, device
         )
         all_results[depth] = results
         all_spike_stats[depth] = spike_stats
