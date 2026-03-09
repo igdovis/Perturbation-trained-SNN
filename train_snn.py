@@ -1,16 +1,3 @@
-# train_snn_v2.py
-# training runner for DualSNN with:
-# - choose which layers/params to train (including output layer fc_out)
-# - train modes:
-#     * sync: train one branch (sgd or wp) and keep the other identical for meaningful cosine diagnostics
-#     * both: train sgd and wp independently, but compute cosine diagnostics on a shared "probe" snapshot
-# - wp: two-sided random-direction estimator, optionally orthogonalized directions
-# - wp noise scope: directions can live in trainable subspace or full parameter space
-# - periodic cosine similarity diagnostics (wp direction vs sgd direction at the same weights)
-# - raster plots + spiking violin summaries
-# - checkpointing + csv logs + simple curve plots
-#
-
 from __future__ import annotations
 
 import argparse
@@ -37,7 +24,7 @@ from snn_models import DualSNN
 from data_utils import get_dataset
 from wp_sgd_metrics import compute_all_metrics, per_layer_cosines, analyze_zero_gradients
 from experiment import plot_per_layer_cosine, plot_spiking_activity_violin, analyze_spiking_activity
-
+from wp_update_variants import estimate_wp_coordwise_adaptive
 
 ######### utils #########
 
@@ -361,6 +348,7 @@ def estimateWpUpdateDirection(
 
     return dWpDict, dWpFlatRet, lossBase, returnKeys
 
+# TODO add adaptive wp argument
 def applyWpUpdateManual(
     modelWp: torch.nn.Module,
     dWpDict: Dict[str, torch.Tensor],
@@ -562,13 +550,21 @@ def parseArgs():
     p.add_argument("--trainBiasLastN", type=int, default=0, help="train biases in last N layers")
     p.add_argument("--includeBiasInDiagnostics", action="store_true")
 
-    # wp estimator
-    p.add_argument("--wpH", type=float, default=0.01)
-    p.add_argument("--wpK", type=int, default=32)
-    p.add_argument("--wpNoise", type=str, default="rademacher", choices=["rademacher", "gaussian"])
+    # wp related
+    p.add_argument("--wpEstimator", type=str, default="random", choices=["random", "coord_sampled", "coord_full"])
+    p.add_argument("--wpH", type=float, default=0.03)
+    p.add_argument("--wpK", type=int, default=16)
+    p.add_argument("--wpNoise", type=str, default="gaussian", choices=["rademacher", "gaussian"])
     p.add_argument("--wpSampling", type=str, default="two_sided", choices=["two_sided", "orthogonal"])
     p.add_argument("--wpNoiseScope", type=str, default="train", choices=["train", "all"], help="noise lives in trainable subspace vs full space")
 
+    # coordinate-wise adaptive WP options
+    p.add_argument("--wpCoordMaxCoords", type=int, default=2000)
+    p.add_argument("--wpCoordAdaptive", action="store_true")
+    p.add_argument("--wpCoordAdaptiveMaxMult", type=int, default=4)
+    p.add_argument("--wpCoordAbsTol", type=float, default=1e-12)
+    p.add_argument("--wpCoordRelTol", type=float, default=1e-8)
+    
     # logging/outputs
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
     p.add_argument("--seed", type=int, default=42)
@@ -584,6 +580,77 @@ def parseArgs():
     p.add_argument("--cosineProbe", type=str, default="wp", choices=["sgd", "wp"], help="only used in trainMode=both")
 
     return p.parse_args()
+
+def estimateWpAnyDirection(
+    dual: DualSNN,
+    xb: torch.Tensor,
+    yb: torch.Tensor,
+    includeReturnFn: Callable[[str], bool],
+    includeNoiseFn: Callable[[str], bool],
+    args,
+):
+    """
+    Choose which wp variant to run based on args.wpEstimator.
+
+    Returns:
+        dWpDict, dWpFlat, lossBase, keys, wpStats
+    """
+    if args.wpEstimator == "random":
+        dWp, dWpFlat, lossBase, keys = estimateWpUpdateDirection(
+            modelWp=dual.wp,
+            xb=xb,
+            yb=yb,
+            includeReturnFn=includeReturnFn,
+            includeNoiseFn=includeNoiseFn,
+            h=float(args.wpH),
+            kSamples=int(args.wpK),
+            noise=str(args.wpNoise),
+            sampling=str(args.wpSampling),
+        )
+        wpStats = {
+            "mode": "random",
+            "num_coords_used": np.nan,
+            "num_coords_total": np.nan,
+            "num_escalated": np.nan,
+            "num_failed": np.nan,
+            "m_hist_all": {},
+            "m_hist_success": {},
+            "m_hist_failed": {},
+            "per_param": {},
+        }
+        return dWp, dWpFlat, lossBase, keys, wpStats
+
+    if args.wpEstimator == "coord_sampled":
+        return estimate_wp_coordwise_adaptive(
+            model_wp=dual.wp,
+            xb=xb,
+            yb=yb,
+            include_fn=includeReturnFn,
+            h=float(args.wpH),
+            mode="sampled",
+            max_coords=int(args.wpCoordMaxCoords),
+            adaptive=bool(args.wpCoordAdaptive),
+            adaptive_max_mult=int(args.wpCoordAdaptiveMaxMult),
+            abs_tol=float(args.wpCoordAbsTol),
+            rel_tol=float(args.wpCoordRelTol),
+        )
+
+    if args.wpEstimator == "coord_full":
+        return estimate_wp_coordwise_adaptive(
+            model_wp=dual.wp,
+            xb=xb,
+            yb=yb,
+            include_fn=includeReturnFn,
+            h=float(args.wpH),
+            mode="full",
+            max_coords=0,
+            adaptive=bool(args.wpCoordAdaptive),
+            adaptive_max_mult=int(args.wpCoordAdaptiveMaxMult),
+            abs_tol=float(args.wpCoordAbsTol),
+            rel_tol=float(args.wpCoordRelTol),
+        )
+
+    raise ValueError(f"unknown wpEstimator: {args.wpEstimator}")
 
 def main():
     args = parseArgs()
@@ -712,16 +779,13 @@ def main():
                     logRow = {"step": globalStep, "epoch": epoch, "loss": float(loss.detach()), "acc": acc, "trainMode": "sync", "trainMaster": "sgd"}
 
                 else:
-                    dWp, _, lossBase, _ = estimateWpUpdateDirection(
-                        modelWp=dual.wp,
+                    dWp, _, lossBase, _, wpStats = estimateWpAnyDirection(
+                        dual=dual,
                         xb=xb,
                         yb=yb,
                         includeReturnFn=includeTrain,
                         includeNoiseFn=includeNoiseFn,
-                        h=float(args.wpH),
-                        kSamples=int(args.wpK),
-                        noise=str(args.wpNoise),
-                        sampling=str(args.wpSampling),
+                        args=args,
                     )
 
                     applyWpUpdateManual(dual.wp, dWp, lr=float(args.lrWp), weightDecay=float(args.weightDecay), includeFn=includeTrain)
@@ -731,7 +795,11 @@ def main():
                         predWp = logitsWp.argmax(dim=1)
                         accWp = float((predWp == yb).float().mean())
 
-                    logRow = {"step": globalStep, "epoch": epoch, "loss": float(lossBase), "acc": accWp, "trainMode": "sync", "trainMaster": "wp"}
+                    logRow = {"step": globalStep, "epoch": epoch, "loss": float(lossBase), 
+                    "acc": accWp, "trainMode": "sync", "trainMaster": "wp",
+                    "wpEstimator": args.wpEstimator, "wpNumCoordsUsed": wpStats.get("num_coords_used", np.nan), "wpNumCoordsTotal": wpStats.get("num_coords_total", np.nan),
+                    "wpNumEscalated": wpStats.get("num_escalated", np.nan), "wpNumFailed": wpStats.get("num_failed", np.nan),
+                    }
                     
             else:
                 # train both
@@ -745,19 +813,17 @@ def main():
                     predSgd = logitsSgd.argmax(dim=1)
                     accSgd = float((predSgd == yb).float().mean())
 
-                dWp, _, lossBase, _ = estimateWpUpdateDirection(
-                    modelWp=dual.wp,
+                dWp, _, lossBase, _, wpStats = estimateWpAnyDirection(
+                    dual=dual,
                     xb=xb,
                     yb=yb,
                     includeReturnFn=includeTrain,
                     includeNoiseFn=includeNoiseFn,
-                    h=float(args.wpH),
-                    kSamples=int(args.wpK),
-                    noise=str(args.wpNoise),
-                    sampling=str(args.wpSampling),
+                    args=args,
                 )
-
-                applyWpUpdateManual(dual.wp, dWp, lr=float(args.lrWp), weightDecay=float(args.weightDecay), includeFn=includeTrain)
+                # add adaptive wp argument
+                applyWpUpdateManual(dual.wp, dWp, lr=float(args.lrWp), weightDecay=float(args.weightDecay), 
+                includeFn=includeTrain)
 
                 with torch.no_grad():
                     logitsWp = dual.wp.forward_logits(xb, record=False)
@@ -772,6 +838,11 @@ def main():
                     "lossWp": float(lossBase),
                     "accWp": accWp,
                     "trainMode": "both",
+                    "wpEstimator": args.wpEstimator,
+                    "wpNumCoordsUsed": wpStats.get("num_coords_used", np.nan),
+                    "wpNumCoordsTotal": wpStats.get("num_coords_total", np.nan),
+                    "wpNumEscalated": wpStats.get("num_escalated", np.nan),
+                    "wpNumFailed": wpStats.get("num_failed", np.nan),
                 }
 
             if globalStep % args.logEvery == 0:
@@ -788,16 +859,13 @@ def main():
                     else:
                         syncParams(dual.sgd, dual.wp)
 
-                dWpDiag, _, wpLossBase, diagKeys = estimateWpUpdateDirection(
-                    modelWp=dual.wp,
+                dWpDiag, _, wpLossBase, diagKeys, wpDiagStats = estimateWpAnyDirection(
+                    dual=dual,
                     xb=xb,
                     yb=yb,
                     includeReturnFn=includeDiag,
                     includeNoiseFn=(includeNoiseFn if args.wpNoiseScope == "train" else (lambda _n: True)),
-                    h=float(args.wpH),
-                    kSamples=int(args.wpK),
-                    noise=str(args.wpNoise),
-                    sampling=str(args.wpSampling),
+                    args=args,
                 )
 
                 dSgdDiag, _, sgdLoss, traces, diagKeysSgd = computeSgdUpdateDirection(
@@ -807,7 +875,9 @@ def main():
                     includeFn=includeDiag,
                     record=(args.rasterEvery > 0 and globalStep % args.rasterEvery == 0),
                 )
-
+                # TODO fix naming later, for now:
+                if diagKeys != diagKeysSgd:
+                    print("warning: wp and sgd diagnostic keys differ")
                 diag = cosineDiagnosticsFromDirs(dWpDiag, dSgdDiag, diagKeysSgd, device=device)
                 diag.update({
                     "step": globalStep,
@@ -817,6 +887,8 @@ def main():
                     "trainMode": args.trainMode,
                     "trainMaster": args.trainMaster if args.trainMode == "sync" else "both",
                     "cosineProbe": args.cosineProbe if args.trainMode == "both" else "synced",
+                    "wpEstimator": args.wpEstimator,
+                    "wpStats": wpDiagStats,
                 })
 
                 cosRows.append({
@@ -824,17 +896,28 @@ def main():
                     "epoch": epoch,
                     "trainMode": args.trainMode,
                     "trainMaster": args.trainMaster if args.trainMode == "sync" else "both",
+                    "wpEstimator": args.wpEstimator,
                     "cos_all": diag["global_metrics"]["cosine_similarity"],
                     "cos_wp": diag["global_metrics_wp"]["cosine_similarity"],
                     "cos_both": diag["global_metrics_both"]["cosine_similarity"],
                     "activeFracWp": diag["global_metrics_wp"]["active_frac"],
                     "activeFracBoth": diag["global_metrics_both"]["active_frac"],
                     "probe": diag["cosineProbe"],
+                    "wpNumCoordsUsed": wpDiagStats.get("num_coords_used", np.nan),
+                    "wpNumCoordsTotal": wpDiagStats.get("num_coords_total", np.nan),
+                    "wpNumEscalated": wpDiagStats.get("num_escalated", np.nan),
+                    "wpNumFailed": wpDiagStats.get("num_failed", np.nan),
                 })
 
                 plot_per_layer_cosine([diag], outDir, suffix=f"_step{globalStep:07d}")
-
-                # raster
+                if args.wpEstimator != "random":
+                    print(
+                        f"step={globalStep} wp={args.wpEstimator} "
+                        f"coordsUsed={wpDiagStats.get('num_coords_used', 'na')} "
+                        f"escalated={wpDiagStats.get('num_escalated', 'na')} "
+                        f"failed={wpDiagStats.get('num_failed', 'na')}"
+                    )
+                                # raster
                 if traces is not None and args.rasterEvery > 0 and globalStep % args.rasterEvery == 0:
                     spkList = traces.get("spk")
                     if isinstance(spkList, (list, tuple)):
