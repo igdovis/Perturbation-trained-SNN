@@ -2,19 +2,20 @@ import argparse
 import json
 from pathlib import Path
 from datetime import datetime
-
+import re
 import numpy as np
 import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import torch
-
+import torch.nn.functional as F
 from snn_models import DualSNN
 from data_utils import get_dataset
-from wp_sgd_metrics import cosine_similarity_wp_sgd_orthogonal
+from wp_sgd_metrics import cosine_similarity_wp_sgd_orthogonal, plot_per_layer_cosine
+from wp_sgd_metrics import compute_all_metrics, per_layer_cosines, analyze_zero_gradients
 from analysis_firing import measure_firing_stats
-
+from wp_update_variants import estimate_wp_coordwise_adaptive
 from experiment import (
     analyze_spiking_activity,
     analyze_surrogate_for_nonfiring,
@@ -22,13 +23,197 @@ from experiment import (
     plot_membrane_voltages,
     plot_surrogate_gradient_function,
     plot_zero_gradient_analysis,
-    plot_nonfiring_gradient_analysis,
-    plot_per_layer_cosine,
+    plot_nonfiring_gradient_analysis
 )
+from wp_adaptive_plots import plot_wp_adaptive_suite
+from train_snn import estimateWpUpdateDirection
 
+def compute_sgd_probe_direction(model, xb, yb, include_fn=None, analyze_details=False):
+    device = xb.device
+
+    named_wp = list(model.wp.named_parameters())
+    named_sgd = list(model.sgd.named_parameters())
+
+    def included(name):
+        if include_fn is not None:
+            return include_fn(name)
+        return True
+
+    # sync sgd branch to wp branch
+    with torch.no_grad():
+        for (_, ps), (_, pw) in zip(named_sgd, named_wp):
+            ps.copy_(pw)
+
+    for _, ps in named_sgd:
+        if ps.grad is not None:
+            ps.grad = None
+
+    with torch.enable_grad():
+        if analyze_details:
+            logits, traces = model.forward_sgd(xb, record=True)
+        else:
+            logits = model.forward_sgd(xb, record=False)
+            traces = None
+        loss = F.cross_entropy(logits, yb)
+        loss.backward()
+
+    dSGD_dict = {}
+    for name, p in named_sgd:
+        if included(name):
+            if p.grad is not None:
+                dSGD_dict[name] = -p.grad.clone()
+            else:
+                dSGD_dict[name] = torch.zeros_like(p)
+
+    return dSGD_dict, traces
+
+def build_probe_result(dWP_dict, dSGD_dict, device, traces=None, wp_stats=None):
+    w_cos, b_cos, comb_cos = per_layer_cosines(dWP_dict, dSGD_dict, exclude_zeros=False)
+    w_cos_wp, b_cos_wp, comb_cos_wp = per_layer_cosines(dWP_dict, dSGD_dict, exclude_zeros="wp")
+    w_cos_both, b_cos_both, comb_cos_both = per_layer_cosines(dWP_dict, dSGD_dict, exclude_zeros="both")
+
+    dWP_chunks = [dWP_dict[n].reshape(-1) for n in dWP_dict.keys()]
+    dSGD_chunks = [dSGD_dict[n].reshape(-1) for n in dSGD_dict.keys()]
+    dWP_vec = torch.cat(dWP_chunks) if dWP_chunks else torch.empty(0, device=device)
+    dSGD_vec = torch.cat(dSGD_chunks) if dSGD_chunks else torch.empty(0, device=device)
+
+    metrics = compute_all_metrics(dWP_vec, dSGD_vec, exclude_zeros=False)
+    metrics_both = compute_all_metrics(dWP_vec, dSGD_vec, exclude_zeros="both")
+    metrics_wp = compute_all_metrics(dWP_vec, dSGD_vec, exclude_zeros="wp")
+    zero_analysis = analyze_zero_gradients(dWP_dict, dSGD_dict)
+
+    result = {
+        "global_metrics": metrics,
+        "global_metrics_both": metrics_both,
+        "global_metrics_wp": metrics_wp,
+        "per_param_zero_analysis": zero_analysis,
+        "dWP_norm": float(dWP_vec.norm()),
+        "dSGD_norm": float(dSGD_vec.norm()),
+        "w_cos": w_cos,
+        "b_cos": b_cos,
+        "comb_cos": comb_cos,
+        "w_cos_wp": w_cos_wp,
+        "b_cos_wp": b_cos_wp,
+        "comb_cos_wp": comb_cos_wp,
+        "w_cos_both": w_cos_both,
+        "b_cos_both": b_cos_both,
+        "comb_cos_both": comb_cos_both,
+        "dWP_dict": dWP_dict,
+        "dSGD_dict": dSGD_dict,
+    }
+
+    if traces is not None:
+        result["traces"] = traces
+    if wp_stats is not None:
+        result["wpStats"] = wp_stats
+
+    return result
+
+def probe_wp_vs_sgd(model, xb, yb, h, args, device, include_fn, analyze_details=False):
+    xb = xb.to(device=device, dtype=torch.float32)
+    yb = torch.as_tensor(yb, device=device)
+    if yb.dtype != torch.long:
+        yb = (yb.argmax(dim=-1) if yb.ndim > 1 else yb).long()
+
+    if args.wpProbeEstimator == "fixed":
+        return cosine_similarity_wp_sgd_orthogonal(
+            model, xb, yb,
+            h=h,
+            include_layers=None,
+            device=device,
+            analyze_details=analyze_details,
+            include_bias=args.include_bias,
+        )
+
+    if args.wpProbeEstimator == "random":
+        include_noise_fn = include_fn if args.wpNoiseScope == "diag" else (lambda _name: True)
+
+        dWP_dict, _, _, keys = estimateWpUpdateDirection(
+            modelWp=model.wp,
+            xb=xb,
+            yb=yb,
+            includeReturnFn=include_fn,
+            includeNoiseFn=include_noise_fn,
+            h=float(h),
+            kSamples=int(args.wpK),
+            noise=str(args.wpNoise),
+            sampling=str(args.wpSampling),
+        )
+
+        wp_stats = {
+            "mode": "random",
+            "loss_base": np.nan,
+            "tol": np.nan,
+            "num_coords_used": np.nan,
+            "num_coords_total": np.nan,
+            "num_escalated": np.nan,
+            "num_failed": np.nan,
+            "m_hist_all": {},
+            "m_hist_success": {},
+            "m_hist_failed": {},
+            "per_param": {},
+            "k": int(args.wpK),
+            "noise": str(args.wpNoise),
+            "sampling": str(args.wpSampling),
+            "noise_scope": str(args.wpNoiseScope),
+        }
+
+    else:
+        dWP_dict, _, _, keys, wp_stats = estimate_wp_coordwise_adaptive(
+            model_wp=model.wp,
+            xb=xb,
+            yb=yb,
+            include_fn=include_fn,
+            h=float(h),
+            mode="sampled" if args.wpProbeEstimator == "coord_sampled" else "full",
+            max_coords=int(args.wpCoordMaxCoords),
+            adaptive=bool(args.wpCoordAdaptive),
+            adaptive_max_mult=int(args.wpCoordAdaptiveMaxMult),
+            abs_tol=float(args.wpCoordAbsTol),
+            rel_tol=float(args.wpCoordRelTol),
+        )
+
+    dSGD_dict, traces = compute_sgd_probe_direction(
+        model=model,
+        xb=xb,
+        yb=yb,
+        include_fn=include_fn,
+        analyze_details=analyze_details,
+    )
+
+    # keep same param order between wp and sgd
+    dWP_dict = {k: dWP_dict[k] for k in keys if k in dWP_dict and k in dSGD_dict}
+    dSGD_dict = {k: dSGD_dict[k] for k in dWP_dict.keys()}
+
+    return build_probe_result(
+        dWP_dict=dWP_dict,
+        dSGD_dict=dSGD_dict,
+        device=device,
+        traces=traces,
+        wp_stats=wp_stats,
+    )
 
 def parse_args():
     p = argparse.ArgumentParser()
+    # wp probe mode
+    p.add_argument("--wpProbeEstimator", type=str, default="fixed", choices=["random", "fixed", "coord_sampled", "coord_full"])
+    # for random aka standard WP estimator
+    p.add_argument("--wpK", type=int, default=16)
+    p.add_argument("--wpNoise", type=str, default="gaussian", choices=["rademacher", "gaussian"])
+    p.add_argument("--wpSampling", type=str, default="two_sided", choices=["two_sided", "orthogonal"])
+    p.add_argument(
+        "--wpNoiseScope",
+        type=str,
+        default="diag",
+        choices=["diag", "all"],
+        help="diag = perturb only included diagnostic parameters, all = perturb full parameter space",
+    )
+    # adaptive coordinate-wise probing options
+    p.add_argument("--wpCoordMaxCoords", type=int, default=2000)
+    p.add_argument("--wpCoordAdaptive", action="store_true")
+    p.add_argument("--wpCoordAdaptiveMaxMult", type=int, default=4)
+    p.add_argument("--wpCoordAbsTol", type=float, default=1e-12)
+    p.add_argument("--wpCoordRelTol", type=float, default=1e-8)
 
     p.add_argument("--dataset", type=str, default="randman", choices=["randman", "shd"])
     p.add_argument("--data_dir", type=str, default="data")
@@ -36,7 +221,7 @@ def parse_args():
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--num_steps", type=int, default=100)
     p.add_argument("--dt", type=float, default=1000)
-
+    
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
     p.add_argument("--seed", type=int, default=42)
 
@@ -64,11 +249,14 @@ def parse_args():
     p.add_argument("--rare_k", type=int, default=2)
 
     # shortlist criteria 
-    p.add_argument("--shortlist_topk", type=int, default=10)
     p.add_argument("--shortlist_min_frac_firing", type=float, default=0.1)
     p.add_argument("--shortlist_max_frac_firing", type=float, default=0.9)
     p.add_argument("--shortlist_min_mean_rate", type=float, default=1e-4)
     p.add_argument("--shortlist_max_layer_std", type=float, default=0.05)
+
+    p.add_argument("--candidate_n_promising", type=int, default=4)
+    p.add_argument("--candidate_n_borderline", type=int, default=4)
+    p.add_argument("--candidate_n_bad", type=int, default=4)
 
     # cosine
     p.add_argument("--h_values", nargs="+", type=float, default=[0.005, 0.01, 0.03])
@@ -77,6 +265,13 @@ def parse_args():
 
     # plots
     p.add_argument("--heatmap_depth", type=int, default=2) #? no
+
+    #diagnostics
+    p.add_argument("--diagLayerIdxs", nargs="+", type=int, default=None)
+    p.add_argument("--diagLastN", type=int, default=0)
+    p.add_argument("--diagBiasOnly", action="store_true")
+    p.add_argument("--diagBiasLastN", type=int, default=0)
+    p.add_argument("--diagScope", type=str, default="all", choices=["all", "subset"])
 
     return p.parse_args()
 
@@ -186,13 +381,21 @@ def summarize_zero_analysis(z):
     total = z.get("total_elements", z.get("total_elems", z.get("total", None)))
     if total is not None:
         out["total_elems"] = to_float(total)
-        for k_src, k_dst in [
-            ("wp_zero", "wp_zero_frac"),
-            ("sgd_zero", "sgd_zero_frac"),
-            ("both_zero", "both_zero_frac"),
-        ]:
-            if k_src in z and out["total_elems"] and out["total_elems"] > 0:
-                out[k_dst] = to_float(z[k_src]) / out["total_elems"]
+        if total > 0:
+            if "wp_zero" in z:
+                out["wp_zero_frac"] = to_float(z["wp_zero"]) / total
+            elif "wp_zero_fraction" in z:
+                out["wp_zero_frac"] = to_float(z["wp_zero_fraction"])
+
+            if "sgd_zero" in z:
+                out["sgd_zero_frac"] = to_float(z["sgd_zero"]) / total
+            elif "sgd_zero_fraction" in z:
+                out["sgd_zero_frac"] = to_float(z["sgd_zero_fraction"])
+
+            if "both_zero" in z:
+                out["both_zero_frac"] = to_float(z["both_zero"]) / total
+            elif "both_zero_fraction" in z:
+                out["both_zero_frac"] = to_float(z["both_zero_fraction"])
         return out
 
     tot = 0.0
@@ -202,14 +405,36 @@ def summarize_zero_analysis(z):
     for v in z.values():
         if not isinstance(v, dict):
             continue
-        t = v.get("total", v.get("total_elements", v.get("n", None)))
-        if t is None:
+
+        n = v.get("n", v.get("total", v.get("total_elements", None)))
+        if n is None:
             continue
-        t = float(t)
-        tot += t
-        wp0 += float(v.get("wp_zero", 0.0))
-        sgd0 += float(v.get("sgd_zero", 0.0))
-        both0 += float(v.get("both_zero", 0.0))
+        n = float(n)
+        if n <= 0:
+            continue
+
+        tot += n
+
+        if "wp_zero_count" in v:
+            wp0 += float(v["wp_zero_count"])
+        elif "wp_zero" in v:
+            wp0 += float(v["wp_zero"])
+        elif "wp_zero_fraction" in v:
+            wp0 += float(v["wp_zero_fraction"]) * n
+
+        if "sgd_zero_count" in v:
+            sgd0 += float(v["sgd_zero_count"])
+        elif "sgd_zero" in v:
+            sgd0 += float(v["sgd_zero"])
+        elif "sgd_zero_fraction" in v:
+            sgd0 += float(v["sgd_zero_fraction"]) * n
+
+        if "both_zero_count" in v:
+            both0 += float(v["both_zero_count"])
+        elif "both_zero" in v:
+            both0 += float(v["both_zero"])
+        elif "both_zero_fraction" in v:
+            both0 += float(v["both_zero_fraction"]) * n
 
     if tot > 0:
         out["total_elems"] = tot
@@ -217,6 +442,108 @@ def summarize_zero_analysis(z):
         out["sgd_zero_frac"] = sgd0 / tot
         out["both_zero_frac"] = both0 / tot
     return out
+
+
+def build_candidate_shortlist(firing_df: pd.DataFrame, args) -> pd.DataFrame:
+    df = firing_df.copy()
+    # loose viability gate
+    df["passes_min_frac"] = df["fracFiringMin"] >= args.shortlist_min_frac_firing
+    df["passes_min_rate"] = df["meanRateAvg"] >= args.shortlist_min_mean_rate
+    df["passes_max_std"] = df["meanRateStdAcrossLayers"] <= args.shortlist_max_layer_std
+    df["passes_max_frac"] = df["fracFiringMin"] <= args.shortlist_max_frac_firing
+
+    # interpret it only as a candidate ranking score
+    df["candidate_score"] = (-df["meanRateStdAcrossLayers"]) + (0.2 * df["nearThrAvg"])
+
+    # categorize regimes
+    conditions = []
+
+    # promising: not silent, not too unstable, not saturated
+    promising_mask = (
+        df["passes_min_frac"] &
+        df["passes_min_rate"] &
+        df["passes_max_std"] &
+        df["passes_max_frac"]
+    )
+
+    # borderline: some signs of life, but not all promising conditions
+    borderline_mask = (
+        (df["passes_min_frac"] | df["passes_min_rate"]) &
+        (~promising_mask)
+    )
+
+    # bad control: little signs of life in the network
+    bad_mask = ~promising_mask & ~borderline_mask
+
+    df["candidate_category"] = "uncategorized"
+    df.loc[promising_mask, "candidate_category"] = "promising"
+    df.loc[borderline_mask, "candidate_category"] = "borderline"
+    df.loc[bad_mask, "candidate_category"] = "bad_control"
+
+    # rate bins inside each category to still get diversity
+    unique_rates = df["meanRateAvg"].nunique()
+    if unique_rates >= 2:
+        q = min(3, unique_rates)
+        df["rateBin"] = pd.qcut(df["meanRateAvg"], q=q, duplicates="drop")
+    else:
+        df["rateBin"] = "all"
+
+    def pick_from_category(sub_df: pd.DataFrame, n_pick: int) -> pd.DataFrame:
+        if len(sub_df) == 0 or n_pick <= 0:
+            return sub_df.head(0).copy()
+
+        n_groups = sub_df.groupby(["depth", "rateBin"]).ngroups
+        per_group = max(1, n_pick // max(1, n_groups))
+
+        picked = (
+            sub_df.sort_values("candidate_score", ascending=False)
+                  .groupby(["depth", "rateBin"], as_index=False)
+                  .head(per_group)
+        )
+
+        if len(picked) < n_pick:
+            remaining = (
+                sub_df.sort_values("candidate_score", ascending=False)
+                      .loc[~sub_df.index.isin(picked.index)]
+                      .head(n_pick - len(picked))
+            )
+            picked = pd.concat([picked, remaining], ignore_index=False)
+
+        return picked.head(n_pick).copy()
+
+    promising = pick_from_category(
+        df[df["candidate_category"] == "promising"],
+        args.candidate_n_promising,
+    )
+    borderline = pick_from_category(
+        df[df["candidate_category"] == "borderline"],
+        args.candidate_n_borderline,
+    )
+    bad = pick_from_category(
+        df[df["candidate_category"] == "bad_control"],
+        args.candidate_n_bad,
+    )
+
+    candidates = pd.concat([promising, borderline, bad], ignore_index=False)
+    candidate_topk = args.candidate_n_promising + args.candidate_n_borderline + args.candidate_n_bad
+    # fallback if categories are sparse
+    if len(candidates) < candidate_topk:
+        remaining = (
+            df.sort_values("candidate_score", ascending=False)
+              .loc[~df.index.isin(candidates.index)]
+              .head(candidate_topk- len(candidates))
+        )
+        candidates = pd.concat([candidates, remaining], ignore_index=False)
+
+    candidates = (
+        candidates
+        .drop_duplicates(subset=["depth", "threshold", "eq31_alpha"])
+        .sort_values(["candidate_category", "candidate_score"], ascending=[True, False])
+        .head(candidate_topk)
+        .copy()
+    )
+
+    return candidates
 
 def compute_near_thr_mass_from_traces(traces, thr, delta):
     # fraction of mem values within [thr-delta, thr+delta], averaged across layers
@@ -304,6 +631,26 @@ def plot_global_cosine_bars_from_res(res, reg_out, tag):
     plt.savefig(reg_out / "plots" / f"global_cosine_{tag}.png", dpi=150, bbox_inches="tight")
     plt.close()
 
+def plot_cosine_by_candidate_category(diag_df, out_dir):
+    if diag_df is None or len(diag_df) == 0:
+        return
+    if "candidate_category" not in diag_df.columns:
+        return
+
+    cats = ["promising", "borderline", "bad_control"]
+    data = [
+        diag_df.loc[diag_df["candidate_category"] == c, "cosine_wp"].dropna().values
+        for c in cats
+    ]
+
+    fig, ax = plt.subplots(figsize=(8,6))
+    ax.boxplot(data, labels=cats)
+    ax.set_ylabel("cosine_wp")
+    ax.set_title("cosine_wp by candidate category")
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(out_dir / "plots" / "cosine_by_candidate_category.png", dpi=150, bbox_inches="tight")
+    plt.close()
 
 def plot_cosine_vs_h_for_regime(cosine_df, reg_out, depth, thr, alpha, tag):
     sub = cosine_df[
@@ -328,7 +675,6 @@ def plot_cosine_vs_h_for_regime(cosine_df, reg_out, depth, thr, alpha, tag):
     ax.errorbar(agg["h"], agg["cosine_wp_mean"], yerr=agg["cosine_wp_std"], marker="o", capsize=3, label="wp-only")
     ax.errorbar(agg["h"], agg["cosine_all_mean"], yerr=agg["cosine_all_std"], marker="o", capsize=3, label="all")
     ax.errorbar(agg["h"], agg["cosine_both_mean"], yerr=agg["cosine_both_std"], marker="o", capsize=3, label="both")
-
     ax.set_xlabel("h")
     ax.set_ylabel("cosine similarity")
     ax.set_title(f"cosine vs h _{tag}")
@@ -338,6 +684,58 @@ def plot_cosine_vs_h_for_regime(cosine_df, reg_out, depth, thr, alpha, tag):
     plt.savefig(reg_out / "plots" / f"cosine_vs_h_{tag}.png", dpi=150, bbox_inches="tight")
     plt.close()
 
+_hiddenPat = re.compile(r"(?:^|.*\.)fcs\.(\d+)\.(weight|bias)$")
+_outPat = re.compile(r"(?:^|.*\.)fc_out\.(weight|bias)$")
+
+def paramLayerIndex(name: str, depthHidden: int):
+    m = _hiddenPat.match(name)
+    if m:
+        return int(m.group(1))
+    if _outPat.match(name):
+        return int(depthHidden)
+    return None
+# function to determine what is included in the cosine computations
+# based on the various args for probe scope (trainLayerIdxs, trainLastN, trainBiasOnly, trainBiasLastN, includeBias, includeOutput)
+def buildIncludeFn(
+    depthHidden: int,
+    trainLayerIdxs,
+    trainLastN,
+    trainBiasOnly,
+    trainBiasLastN,
+    includeBias,
+    includeOutput: bool = True,
+):
+    maxLayer = depthHidden + (1 if includeOutput else 0)
+
+    def include(name: str) -> bool:
+        li = paramLayerIndex(name, depthHidden)
+        if li is None:
+            return False
+        if (not includeOutput) and li == depthHidden:
+            return False
+
+        kind = "bias" if name.endswith(".bias") else "weight"
+        if (not includeBias) and kind == "bias":
+            return False
+
+        if trainBiasOnly and kind != "bias":
+            return False
+
+        if trainBiasLastN is not None and trainBiasLastN > 0:
+            if kind != "bias":
+                return False
+            if li < (maxLayer - trainBiasLastN):
+                return False
+
+        if trainLayerIdxs is not None and len(trainLayerIdxs) > 0:
+            return li in trainLayerIdxs
+
+        if trainLastN is not None and trainLastN > 0:
+            return li >= (maxLayer - trainLastN)
+
+        return True
+
+    return include
 
 def main():
     args = parse_args()
@@ -361,6 +759,7 @@ def main():
     for depth in range(args.depth_min, args.depth_max + 1):
         for thr in args.thresholds:
             for alpha in alpha_list:
+                print(f"Measuring firing stats for depth={depth}, thr={thr}, eq31_alpha={alpha}...")
                 # new init per config 
                 torch.manual_seed(args.seed)
                 np.random.seed(args.seed)
@@ -377,7 +776,8 @@ def main():
                     surrogate_fn=surrogate_fn,
                     eq31_alpha=alpha,  
                 )
-
+                model.wp.to(device)
+                model.sgd.to(device)
                 per_layer, summary = measure_firing_stats(
                     model,
                     loader,
@@ -426,59 +826,30 @@ def main():
         )
 
     # shortlist candidates based on criteria
-    filt = firing_df[
-        (firing_df["fracFiringMin"] >= args.shortlist_min_frac_firing) &
-        # (firing_df["fracFiringMin"] <= args.shortlist_max_frac_firing) &
-        (firing_df["meanRateAvg"] >= args.shortlist_min_mean_rate) &
-        (firing_df["meanRateStdAcrossLayers"] <= args.shortlist_max_layer_std)
-    ].copy()
-
-    if len(filt) == 0:
-        filt = firing_df.copy()
-
-    # score: need to refine later
-    filt["score"] = (-filt["meanRateStdAcrossLayers"]) + (0.2 * filt["nearThrAvg"])
-    # bin by meanRateAvg into quantiles eg bins low/med/high
-    num_bins = 3
-    unique_rates = filt["meanRateAvg"].nunique()
-
-    if unique_rates >= 2:
-        q = min(num_bins, unique_rates)  # to avoid error if not enough unique values
-        filt["rateBin"] = pd.qcut(filt["meanRateAvg"], q=q, duplicates="drop")
-    else:
-        filt["rateBin"] = "all"
-
-    # how many per (depth, rateBin)
-    # spread across bins+depths but never exceed shortlist_topk overall
-    n_groups = filt.groupby(["depth", "rateBin"]).ngroups
-    per_group = max(1, args.shortlist_topk // max(1, n_groups))
-
-    shortlist = (
-        filt.sort_values("score", ascending=False)
-            .groupby(["depth", "rateBin"], as_index=False)
-            .head(per_group)
-    )
-
-    # if we didnt reach topk, fill remaining with best overall not already included
-    if len(shortlist) < args.shortlist_topk:
-        remaining = (
-            filt.sort_values("score", ascending=False)
-                .loc[~filt.index.isin(shortlist.index)]
-                .head(args.shortlist_topk - len(shortlist))
-        )
-        shortlist = pd.concat([shortlist, remaining], ignore_index=False)
-
-    shortlist = shortlist.sort_values("score", ascending=False).head(args.shortlist_topk).copy()
-
-    shortlist.to_csv(out_dir / "data" / "shortlist.csv", index=False)
+    candidate_df = build_candidate_shortlist(firing_df, args)
+    candidate_df.to_csv(out_dir / "data" / "candidate_shortlist.csv", index=False)
     reg_dirs = {} 
     regime_diag_rows = []
-    cosine_rows = []
-    for _, row in shortlist.iterrows():
+    cosine_rows = []    
+
+    for _, row in candidate_df.iterrows():
         depth = int(row["depth"])
+        if args.diagScope == "subset":
+            include_fn = buildIncludeFn(
+                depthHidden=depth,
+                trainLayerIdxs=args.diagLayerIdxs,
+                trainLastN=(args.diagLastN if args.diagLastN > 0 else None),
+                trainBiasOnly=bool(args.diagBiasOnly),
+                trainBiasLastN=(args.diagBiasLastN if args.diagBiasLastN > 0 else None),
+                includeBias=bool(args.include_bias),
+                includeOutput=True,
+            )
+        else:
+            include_fn = lambda name: (args.include_bias or (not name.endswith(".bias")))
         thr = float(row["threshold"])
         alpha = float(row["eq31_alpha"])
         tag = f"d{depth}_thr{thr:.3f}_a{alpha:.3f}".replace(".", "p")
+        print(f"Probing regime for shortlist candidate: depth={depth}, thr={thr}, eq31_alpha={alpha} (tag={tag})...")
         model = DualSNN(
             inDim=input_dim,
             hidden=args.hidden,
@@ -491,23 +862,29 @@ def main():
             surrogate_fn=surrogate_fn,
             eq31_alpha=alpha,
         )
-
+        model.wp.to(device)
+        model.sgd.to(device)
         it = iter(loader)
+        pre_sampled_batches = []
+        for bi in range(args.cosine_batches):
+            try:
+                xb, yb = next(it)
+            except StopIteration:
+                it = iter(loader)
+                xb, yb = next(it)
+            pre_sampled_batches.append((xb, yb))
         for h in args.h_values:
-            for bi in range(args.cosine_batches):
-                try:
-                    xb, yb = next(it)
-                except StopIteration:
-                    it = iter(loader)
-                    xb, yb = next(it)
+            for bi, (xb, yb) in enumerate(pre_sampled_batches):
                 do_details = (bi == 0 and h == args.h_values[0])
-                res = cosine_similarity_wp_sgd_orthogonal(
-                    model, xb, yb,
+                res = probe_wp_vs_sgd(
+                    model=model,
+                    xb=xb,
+                    yb=yb,
                     h=h,
-                    include_layers=None,
+                    args=args,
                     device=device,
+                    include_fn=include_fn,
                     analyze_details=do_details,
-                    include_bias=args.include_bias,
                 )
                 gm = res.get("global_metrics", {})
                 gm_wp = res.get("global_metrics_wp", {})
@@ -542,6 +919,13 @@ def main():
                     # surrogate gradient function plot
                     plot_surrogate_gradient_function(args.surrogate, args.slope, reg_out, thr=thr)
 
+                    # adaptive wp plots
+                    if "wpStats" in res:
+                        plot_wp_adaptive_suite(
+                            wp_stats=res["wpStats"],
+                            out_dir=reg_out / "plots/adaptiveWP",
+                            prefix=f"{tag}_",
+                        )
                     # regime diag summary row
                     zsum = summarize_zero_analysis(res.get("per_param_zero_analysis", None))
                     near_mass = np.nan
@@ -585,12 +969,27 @@ def main():
 
                         # spike derivative summary
                         **deriv_sum,
+
+                        "wpProbeEstimator": args.wpProbeEstimator,
+                        "wpNumCoordsUsed": to_float(res.get("wpStats", {}).get("num_coords_used", np.nan)),
+                        "wpNumCoordsTotal": to_float(res.get("wpStats", {}).get("num_coords_total", np.nan)),
+                        "wpNumEscalated": to_float(res.get("wpStats", {}).get("num_escalated", np.nan)),
+                        "wpNumFailed": to_float(res.get("wpStats", {}).get("num_failed", np.nan)),
+
+                        "candidate_category": row.get("candidate_category", "uncategorized"),
+                        "candidate_score": float(row.get("candidate_score", np.nan)),
+                        "wpK": int(args.wpK) if args.wpProbeEstimator == "random" else np.nan,
+                        "wpNoise": args.wpNoise if args.wpProbeEstimator == "random" else "",
+                        "wpSampling": args.wpSampling if args.wpProbeEstimator == "random" else "",
+                        "wpNoiseScope": args.wpNoiseScope if args.wpProbeEstimator == "random" else "",
                     })
                     res_to_save = dict(res)
                     res_to_save.pop("traces", None)  # avoiding dumping full tensors
+                    res_to_save.pop("dWP_dict", None)
+                    res_to_save.pop("dSGD_dict", None)
                     with open(reg_out / "data" / "cosine_details.json", "w") as f:
                         json.dump(res_to_save, f, indent=2, default=str)
-
+                    
                 cosine_rows.append({
                     "depth": depth,
                     "threshold": thr,
@@ -615,6 +1014,18 @@ def main():
                     "dSGD_norm": float(res.get("dSGD_norm", np.nan)),
                     "pearson_all": float(gm.get("pearson_correlation", np.nan)) if gm.get("pearson_correlation", None) is not None else np.nan,
                     "sign_all": float(gm.get("sign_agreement", np.nan)) if gm.get("sign_agreement", None) is not None else np.nan, 
+                
+                    "wpProbeEstimator": args.wpProbeEstimator,
+                    "wpNumCoordsUsed": float(res.get("wpStats", {}).get("num_coords_used", np.nan)),
+                    "wpNumCoordsTotal": float(res.get("wpStats", {}).get("num_coords_total", np.nan)),
+                    "wpNumEscalated": float(res.get("wpStats", {}).get("num_escalated", np.nan)),
+                    "wpNumFailed": float(res.get("wpStats", {}).get("num_failed", np.nan)),
+                    "candidate_category": row.get("candidate_category", "uncategorized"),
+                    "candidate_score": float(row.get("candidate_score", np.nan)),
+                    "wpK": int(args.wpK) if args.wpProbeEstimator == "random" else np.nan,
+                    "wpNoise": args.wpNoise if args.wpProbeEstimator == "random" else "",
+                    "wpSampling": args.wpSampling if args.wpProbeEstimator == "random" else "",
+                    "wpNoiseScope": args.wpNoiseScope if args.wpProbeEstimator == "random" else "",
                 })
 
     cosine_df = pd.DataFrame(cosine_rows)
@@ -623,6 +1034,7 @@ def main():
         diag_df = pd.DataFrame(regime_diag_rows)
         diag_df.to_csv(out_dir / "data" / "regime_diagnostics.csv", index=False)
         plot_findings(diag_df, out_dir)
+        plot_cosine_by_candidate_category(diag_df, out_dir)
         for (d, t, a), (reg_out, tag) in reg_dirs.items():
             plot_cosine_vs_h_for_regime(cosine_df, reg_out, d, t, a, tag)
     # aggregate over h and batches (for plotting)

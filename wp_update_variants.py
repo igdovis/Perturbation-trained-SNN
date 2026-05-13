@@ -332,9 +332,8 @@ def estimate_wp_coordwise_sampled(
     for (name, p), meta in zip(named, metas):
         g = torch.zeros_like(p).reshape(-1)
         idx_flat = selected_per_param[name]
-
         param_stats = make_empty_param_stats(num_coords_total=int(p.numel()))
-
+        param_stats["used_idx"] = [int(x) for x in idx_flat.detach().cpu().tolist()]
         for j in idx_flat.tolist():
             grad_est, chosen_m, failed = adaptive_two_sided_coordinate_fd(
                 model=model_wp,

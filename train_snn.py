@@ -22,10 +22,10 @@ import torch.nn.functional as F
 
 from snn_models import DualSNN
 from data_utils import get_dataset
-from wp_sgd_metrics import compute_all_metrics, per_layer_cosines, analyze_zero_gradients
-from experiment import plot_per_layer_cosine, plot_spiking_activity_violin, analyze_spiking_activity
+from wp_sgd_metrics import compute_all_metrics, per_layer_cosines, analyze_zero_gradients,  plot_per_layer_cosine
+from experiment import plot_spiking_activity_violin, analyze_spiking_activity, plot_zero_gradient_analysis, analyze_surrogate_for_nonfiring, plot_nonfiring_gradient_analysis
 from wp_update_variants import estimate_wp_coordwise_adaptive
-
+from wp_adaptive_plots import plot_wp_adaptive_suite
 ######### utils #########
 
 def toLongLabels(yb: torch.Tensor) -> torch.Tensor:
@@ -419,12 +419,60 @@ def computeSgdUpdateDirection(
 
 # diagnostics
 
+def directionNormStats(
+    model: torch.nn.Module,
+    dDict: Dict[str, torch.Tensor],
+    includeFn: Callable[[str], bool],
+    lr: float,
+    prefix: str,
+) -> dict:
+    updSq = 0.0
+    paramSq = 0.0
+    absVals = []
+
+    with torch.no_grad():
+        for name, p in model.named_parameters():
+            if not includeFn(name):
+                continue
+
+            paramSq += float((p.detach() ** 2).sum().item())
+
+            upd = dDict.get(name, None)
+            if upd is None:
+                continue
+
+            u = upd.detach()
+            updSq += float((u ** 2).sum().item())
+            absVals.append(u.abs().reshape(-1))
+
+    updateNorm = math.sqrt(updSq)
+    paramNorm = math.sqrt(paramSq)
+    stepNorm = float(lr) * updateNorm
+
+    if len(absVals) > 0:
+        absCat = torch.cat(absVals)
+        meanAbs = float(absCat.mean().item())
+        maxAbs = float(absCat.max().item())
+    else:
+        meanAbs = float("nan")
+        maxAbs = float("nan")
+
+    return {
+        f"{prefix}UpdateNorm": updateNorm,
+        f"{prefix}StepNorm": stepNorm,
+        f"{prefix}ParamNorm": paramNorm,
+        f"{prefix}RelativeStepNorm": stepNorm / max(paramNorm, 1e-12),
+        f"{prefix}MeanAbsUpdate": meanAbs,
+        f"{prefix}MaxAbsUpdate": maxAbs,
+    }
 
 def cosineDiagnosticsFromDirs(
     dWp: Dict[str, torch.Tensor],
     dSgd: Dict[str, torch.Tensor],
     keys: List[str],
     device: torch.device,
+    wpStats: Optional[dict] = None,
+    zeroOnlyUsed: bool = False,
 ) -> dict:
     dWpVec = torch.cat([dWp[k].reshape(-1) for k in keys], dim=0) if keys else torch.empty(0, device=device)
     dSgdVec = torch.cat([dSgd[k].reshape(-1) for k in keys], dim=0) if keys else torch.empty(0, device=device)
@@ -437,7 +485,12 @@ def cosineDiagnosticsFromDirs(
     wCosWp, bCosWp, combCosWp = per_layer_cosines(dWp, dSgd, exclude_zeros="wp")
     wCosBoth, bCosBoth, combCosBoth = per_layer_cosines(dWp, dSgd, exclude_zeros="both")
 
-    zeroAnalysis = analyze_zero_gradients(dWp, dSgd)
+    zeroAnalysis = analyze_zero_gradients(
+        dWp,
+        dSgd,
+        wp_stats=wpStats,
+        only_used=zeroOnlyUsed,
+)
 
     return {
         "global_metrics": gm,
@@ -455,11 +508,130 @@ def cosineDiagnosticsFromDirs(
         "per_param_zero_analysis": zeroAnalysis,
         "dWP_norm": float(dWpVec.norm()),
         "dSGD_norm": float(dSgdVec.norm()),
+        "dWP_dict": dWp,
+        "dSGD_dict": dSgd,
     }
 
 
 # ===================== plots =
+def plotValidationCurves(epochDf: pd.DataFrame, outDir: Path, mode: str) -> None:
+    if epochDf is None or len(epochDf) == 0:
+        return
 
+    fig, ax = plt.subplots(figsize=(10, 4))
+    if mode == "both":
+        if "validAccSgd" in epochDf.columns:
+            ax.plot(epochDf["epoch"], epochDf["validAccSgd"], marker="o", label="sgd valid acc")
+        if "validAccWp" in epochDf.columns:
+            ax.plot(epochDf["epoch"], epochDf["validAccWp"], marker="o", label="wp valid acc")
+    else:
+        if "validAcc" in epochDf.columns:
+            ax.plot(epochDf["epoch"], epochDf["validAcc"], marker="o", label="valid acc")
+    ax.set_xlabel("epoch")
+    ax.set_ylabel("accuracy")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(outDir / "plots" / "valid_accuracy.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(10, 4))
+    if mode == "both":
+        if "validLossSgd" in epochDf.columns:
+            ax.plot(epochDf["epoch"], epochDf["validLossSgd"], marker="o", label="sgd valid loss")
+        if "validLossWp" in epochDf.columns:
+            ax.plot(epochDf["epoch"], epochDf["validLossWp"], marker="o", label="wp valid loss")
+    else:
+        if "validLoss" in epochDf.columns:
+            ax.plot(epochDf["epoch"], epochDf["validLoss"], marker="o", label="valid loss")
+    ax.set_xlabel("epoch")
+    ax.set_ylabel("loss")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(outDir / "plots" / "valid_loss.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+def plotCosineOverTime(cosDf, outDir) -> None:
+    if cosDf is None or len(cosDf) == 0:
+        return
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(cosDf["step"], cosDf["cos_all"], marker="o", label="cosine all")
+    ax.plot(cosDf["step"], cosDf["cos_wp"], marker="o", label="cosine wp nonzero")
+    ax.plot(cosDf["step"], cosDf["cos_both"], marker="o", label="cosine both nonzero")
+    
+    ax.axhline(0.0, linewidth=1.0)
+    ax.set_xlabel("step")
+    ax.set_ylabel("cosine similarity")
+    ax.set_title("wp-sgd update cos sim over training")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    
+    fig.tight_layout()
+    fig.savefig(outDir / "plots" / "cosine_over_time.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    
+def plotActiveFractionOverTime(cosDf, outDir) -> None:
+    if cosDf is None or len(cosDf) == 0:
+        return
+    
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(cosDf["step"], cosDf["activeFracWp"], marker="o", label="wp nonzero active fraction")
+    ax.plot(cosDf["step"], cosDf["activeFracBoth"], marker="o", label="both nonzero active fraction")
+    
+    ax.set_xlabel("step")
+    ax.set_ylabel("active fraction")
+    ax.set_title("active coordinate fraction over training")
+    ax.set_ylim(0.0, 1.05)
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+
+    fig.tight_layout()
+    fig.savefig(outDir / "plots" / "active_fraction_over_time.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+def plotWpStepDiagnostics(trainDf: pd.DataFrame, outDir: Path) -> None:
+    if trainDf is None or len(trainDf) == 0:
+        return
+
+    if "deltaLossWp" in trainDf.columns:
+        fig, ax = plt.subplots(figsize=(10, 4))
+        ax.plot(trainDf["step"], trainDf["deltaLossWp"], marker="o", label="delta loss wp")
+        ax.axhline(0.0, linewidth=1)
+        ax.set_xlabel("step")
+        ax.set_ylabel("loss post - loss pre")
+        ax.set_title("local effect of wp update")
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+        fig.tight_layout()
+        fig.savefig(outDir / "plots" / "wp_delta_loss.png", dpi=150, bbox_inches="tight")
+        plt.close(fig)
+
+    cols = [
+        "wpUpdateNorm",
+        "wpStepNorm",
+        "wpRelativeStepNorm",
+        "wpMeanAbsUpdate",
+        "wpMaxAbsUpdate",
+    ]
+    available = [c for c in cols if c in trainDf.columns]
+    if len(available) == 0:
+        return
+
+    fig, ax = plt.subplots(figsize=(10, 4))
+    for c in available:
+        ax.plot(trainDf["step"], trainDf[c], marker="o", label=c)
+
+    ax.set_xlabel("step")
+    ax.set_ylabel("value")
+    ax.set_title("wp update size diagnostics")
+    ax.set_yscale("log")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+
+    fig.tight_layout()
+    fig.savefig(outDir / "plots" / "wp_update_norms.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
 
 def plotTrainingCurves(trainDf: pd.DataFrame, outDir: Path, mode: str) -> None:
     if trainDf is None or len(trainDf) == 0:
@@ -512,8 +684,8 @@ def parseArgs():
     p.add_argument("--batchSize", type=int, default=32)
     p.add_argument("--num_steps", type=int, default=100)
     # model
-    p.add_argument("--depth", type=int, default=5, help="number of hidden layers")
-    p.add_argument("--hidden", type=int, default=64)
+    p.add_argument("--depth", type=int, default=3, help="number of hidden layers")
+    p.add_argument("--hidden", type=int, default=32)
     p.add_argument("--threshold", type=float, default=1.0)
 
     # tau/beta
@@ -535,12 +707,12 @@ def parseArgs():
     p.add_argument("--slope", type=float, default=25.0)
 
     # training mode
-    p.add_argument("--trainMode", type=str, default="sync", choices=["sync", "both"])
-    p.add_argument("--trainMaster", type=str, default="sgd", choices=["sgd", "wp"], help="only used in trainMode=sync")
+    p.add_argument("--trainMode", type=str, default="both", choices=["sync", "both"])
+    p.add_argument("--trainMaster", type=str, default="wp", choices=["sgd", "wp"], help="only used in trainMode=sync")
 
-    p.add_argument("--epochs", type=int, default=10)
-    p.add_argument("--lrSgd", type=float, default=1e-3)
-    p.add_argument("--lrWp", type=float, default=1e-3)
+    p.add_argument("--epochs", type=int, default=20)
+    p.add_argument("--lrSgd", type=float, default=0.005)
+    p.add_argument("--lrWp", type=float, default=0.005)
     p.add_argument("--weightDecay", type=float, default=0.0)
 
     # layer selection
@@ -558,7 +730,7 @@ def parseArgs():
     p.add_argument("--wpSampling", type=str, default="two_sided", choices=["two_sided", "orthogonal"])
     p.add_argument("--wpNoiseScope", type=str, default="train", choices=["train", "all"], help="noise lives in trainable subspace vs full space")
 
-    # coordinate-wise adaptive WP options
+    # coordinatewise adaptive WP options
     p.add_argument("--wpCoordMaxCoords", type=int, default=2000)
     p.add_argument("--wpCoordAdaptive", action="store_true")
     p.add_argument("--wpCoordAdaptiveMaxMult", type=int, default=4)
@@ -571,12 +743,12 @@ def parseArgs():
     p.add_argument("--outputDir", type=str, default="results_train")
     p.add_argument("--experimentName", type=str, default=None)
 
-    p.add_argument("--logEvery", type=int, default=50)
-    p.add_argument("--cosineEvery", type=int, default=200)
+    p.add_argument("--logEvery", type=int, default=500)
+    p.add_argument("--cosineEvery", type=int, default=500)
     p.add_argument("--rasterEvery", type=int, default=500)
-    p.add_argument("--spikeViolinEvery", type=int, default=0)
+    p.add_argument("--spikeViolinEvery", type=int, default=500)
     p.add_argument("--ckptEvery", type=int, default=500)
-
+    p.add_argument("--nonfiringEvery", type=int, default=0)
     p.add_argument("--cosineProbe", type=str, default="wp", choices=["sgd", "wp"], help="only used in trainMode=both")
 
     return p.parse_args()
@@ -714,15 +886,7 @@ def main():
         includeOutput=True,
     )
 
-    includeDiag = buildIncludeFn(
-        depthHidden=args.depth,
-        trainLayerIdxs=None,
-        trainLastN=None,
-        trainBiasOnly=False,
-        trainBiasLastN=None,
-        includeBias=bool(args.includeBiasInDiagnostics),
-        includeOutput=True,
-    )
+    includeDiag = includeTrain
 
     includeNoiseTrain = includeTrain
     includeNoiseAll = lambda _n: True
@@ -747,11 +911,18 @@ def main():
     
     trainRows: List[dict] = []
     cosRows: List[dict] = []
-
+    epochRows: List[dict] = []
     globalStep = 0
     totalSteps = max(1, args.epochs * len(trainLoader))
 
     for epoch in range(args.epochs):
+        seenSgd = 0
+        correctSgd = 0
+        lossSumSgd = 0.0
+
+        seenWp = 0
+        correctWp = 0
+        lossSumWp = 0.0
         print(f"Epoch {epoch+1}/{args.epochs}")
         dual.train()
         for xb, yb in trainLoader:
@@ -763,7 +934,9 @@ def main():
                 betaNow = scheduleValue(beta0, float(args.betaEnd), float(globalStep) / float(totalSteps), args.betaSchedule)
                 updateNeuronHyperparams(dual.wp, beta=betaNow)
                 updateNeuronHyperparams(dual.sgd, beta=betaNow)
-
+            # i think this is slightly off and logits are ocmpared flawedly.
+            # TODO remake as in trainMode = both
+            # later tho cause were not using this
             if args.trainMode == "sync":
                 if args.trainMaster == "sgd":
                     optSgd.zero_grad(set_to_none=True)
@@ -787,8 +960,23 @@ def main():
                         includeNoiseFn=includeNoiseFn,
                         args=args,
                     )
-
+                    ### direction norm stats block
+                    wpNormStats = directionNormStats(
+                        model=dual.wp,
+                        dDict=dWp,
+                        includeFn=includeTrain,
+                        lr=float(args.lrWp),
+                        prefix="wp",
+                    )
+                    lossWpPre = float(lossBase)
                     applyWpUpdateManual(dual.wp, dWp, lr=float(args.lrWp), weightDecay=float(args.weightDecay), includeFn=includeTrain)
+                    with torch.no_grad():
+                        logitsWpPost = dual.wp.forward_logits(xb, record=False)
+                        lossWpPost = F.cross_entropy(logitsWpPost, yb).detach()
+
+                    deltaLossWp = float(lossWpPost.item()) - lossWpPre
+                    ### direction norm stats block end
+                    
                     syncParams(dual.sgd, dual.wp)
                     with torch.no_grad():
                         logitsWp = dual.wp.forward_logits(xb, record=False)
@@ -799,20 +987,18 @@ def main():
                     "acc": accWp, "trainMode": "sync", "trainMaster": "wp",
                     "wpEstimator": args.wpEstimator, "wpNumCoordsUsed": wpStats.get("num_coords_used", np.nan), "wpNumCoordsTotal": wpStats.get("num_coords_total", np.nan),
                     "wpNumEscalated": wpStats.get("num_escalated", np.nan), "wpNumFailed": wpStats.get("num_failed", np.nan),
+                    "lossWpPre": lossWpPre, "lossWpPostBatch": float(lossWpPost.item()), "deltaLossWp": deltaLossWp,
+                    **wpNormStats,
                     }
                     
             else:
                 # train both
                 optSgd.zero_grad(set_to_none=True)
-                logitsSgd = dual.forward_sgd(xb, record=False)
-                lossSgd = F.cross_entropy(logitsSgd, yb)
-                lossSgd.backward()
+                logitsSgdPre = dual.forward_sgd(xb, record=False)
+                lossSgdPre = F.cross_entropy(logitsSgdPre, yb)
+                lossSgdPre.backward()
                 optSgd.step()
-
-                with torch.no_grad():
-                    predSgd = logitsSgd.argmax(dim=1)
-                    accSgd = float((predSgd == yb).float().mean())
-
+                #then wp update
                 dWp, _, lossBase, _, wpStats = estimateWpAnyDirection(
                     dual=dual,
                     xb=xb,
@@ -821,133 +1007,229 @@ def main():
                     includeNoiseFn=includeNoiseFn,
                     args=args,
                 )
-                # add adaptive wp argument
-                applyWpUpdateManual(dual.wp, dWp, lr=float(args.lrWp), weightDecay=float(args.weightDecay), 
-                includeFn=includeTrain)
-
+                ### direction norm stats block
+                wpNormStats = directionNormStats(
+                    model=dual.wp,
+                    dDict=dWp,
+                    includeFn=includeTrain,
+                    lr=float(args.lrWp),
+                    prefix="wp",
+                )
+                lossWpPre = float(lossBase)
+                applyWpUpdateManual(dual.wp, dWp, lr=float(args.lrWp), weightDecay=float(args.weightDecay), includeFn=includeTrain)
                 with torch.no_grad():
-                    logitsWp = dual.wp.forward_logits(xb, record=False)
-                    predWp = logitsWp.argmax(dim=1)
-                    accWp = float((predWp == yb).float().mean())
+                    logitsWpPost = dual.wp.forward_logits(xb, record=False)
+                    lossWpPost = F.cross_entropy(logitsWpPost, yb).detach()
+
+                deltaLossWp = float(lossWpPost.item()) - lossWpPre
+                ### direction norm stats block end
+                
+                with torch.no_grad():
+                    logitsSgdPost = dual.forward_sgd(xb, record=False)
+                    logitsWpPost = dual.wp.forward_logits(xb, record=False)
+                    lossSgdPost = F.cross_entropy(logitsSgdPost, yb).detach()
+                    lossWpPost = F.cross_entropy(logitsWpPost, yb).detach()
+
+                    predSgd = logitsSgdPost.argmax(dim=1)
+                    predWp = logitsWpPost.argmax(dim=1)
+
+                batchCorrectSgd = int((predSgd == yb).sum().item())
+                batchCorrectWp = int((predWp == yb).sum().item())
+
+                batchAccSgd = batchCorrectSgd / int(yb.numel())
+                batchAccWp = batchCorrectWp / int(yb.numel())
+
+                bs = int(yb.numel())
+
+                seenSgd += bs
+                correctSgd += batchCorrectSgd
+                lossSumSgd += float(lossSgdPost.item()) * bs
+
+                seenWp += bs
+                correctWp += batchCorrectWp
+                lossSumWp += float(lossWpPost.item()) * bs
+
+                runningAccSgd = correctSgd / seenSgd
+                runningLossSgd = lossSumSgd / seenSgd
+
+                runningAccWp = correctWp / seenWp
+                runningLossWp = lossSumWp / seenWp
+
 
                 logRow = {
                     "step": globalStep,
                     "epoch": epoch,
-                    "lossSgd": float(lossSgd.detach()),
-                    "accSgd": accSgd,
-                    "lossWp": float(lossBase),
-                    "accWp": accWp,
+                    "lossSgd": runningLossSgd,
+                    "accSgd": runningAccSgd,
+                    "lossWp": runningLossWp,
+                    "accWp": runningAccWp,
                     "trainMode": "both",
                     "wpEstimator": args.wpEstimator,
                     "wpNumCoordsUsed": wpStats.get("num_coords_used", np.nan),
                     "wpNumCoordsTotal": wpStats.get("num_coords_total", np.nan),
                     "wpNumEscalated": wpStats.get("num_escalated", np.nan),
                     "wpNumFailed": wpStats.get("num_failed", np.nan),
+                    "lossWpPre": lossWpPre,
+                    "lossWpPostBatch": float(lossWpPost.item()),
+                    "deltaLossWp": deltaLossWp,
+                    **wpNormStats,
                 }
+            trainRows.append(logRow)
+            if globalStep > 0 and globalStep % args.logEvery == 0:
+                print("step {}: Running WP Acc: {:.4f}, Loss: {:.4f} | Running SGD Acc: {:.4f}, Loss: {:.4f}".format(
+                    logRow.get("step", float("nan")),
+                    logRow.get("accWp", float("nan")),
+                    logRow.get("lossWp", float("nan")),
+                    logRow.get("accSgd", float("nan")),
+                    logRow.get("lossSgd", float("nan"))
+                ))
 
-            if globalStep % args.logEvery == 0:
-                trainRows.append(logRow)
+            traces = None
+            diagForJson = None
 
             if args.cosineEvery > 0 and globalStep % args.cosineEvery == 0:
                 wpState = None
                 sgdState = None
-                if args.trainMode == "both":
-                    wpState = copy.deepcopy(dual.wp.state_dict())
-                    sgdState = copy.deepcopy(dual.sgd.state_dict())
-                    if args.cosineProbe == "sgd":
-                        syncParams(dual.wp, dual.sgd)
-                    else:
-                        syncParams(dual.sgd, dual.wp)
 
-                dWpDiag, _, wpLossBase, diagKeys, wpDiagStats = estimateWpAnyDirection(
-                    dual=dual,
-                    xb=xb,
-                    yb=yb,
-                    includeReturnFn=includeDiag,
-                    includeNoiseFn=(includeNoiseFn if args.wpNoiseScope == "train" else (lambda _n: True)),
-                    args=args,
-                )
+                try:
+                    if args.trainMode == "both":
+                        wpState = copy.deepcopy(dual.wp.state_dict())
+                        sgdState = copy.deepcopy(dual.sgd.state_dict())
 
-                dSgdDiag, _, sgdLoss, traces, diagKeysSgd = computeSgdUpdateDirection(
-                    dual=dual,
-                    xb=xb,
-                    yb=yb,
-                    includeFn=includeDiag,
-                    record=(args.rasterEvery > 0 and globalStep % args.rasterEvery == 0),
-                )
-                # TODO fix naming later, for now:
-                if diagKeys != diagKeysSgd:
-                    print("warning: wp and sgd diagnostic keys differ")
-                diag = cosineDiagnosticsFromDirs(dWpDiag, dSgdDiag, diagKeysSgd, device=device)
-                diag.update({
-                    "step": globalStep,
-                    "epoch": epoch,
-                    "lossSgd": sgdLoss,
-                    "lossWpBase": wpLossBase,
-                    "trainMode": args.trainMode,
-                    "trainMaster": args.trainMaster if args.trainMode == "sync" else "both",
-                    "cosineProbe": args.cosineProbe if args.trainMode == "both" else "synced",
-                    "wpEstimator": args.wpEstimator,
-                    "wpStats": wpDiagStats,
-                })
+                        if args.cosineProbe == "sgd":
+                            syncParams(dual.wp, dual.sgd)
+                        else:
+                            syncParams(dual.sgd, dual.wp)
 
-                cosRows.append({
-                    "step": globalStep,
-                    "epoch": epoch,
-                    "trainMode": args.trainMode,
-                    "trainMaster": args.trainMaster if args.trainMode == "sync" else "both",
-                    "wpEstimator": args.wpEstimator,
-                    "cos_all": diag["global_metrics"]["cosine_similarity"],
-                    "cos_wp": diag["global_metrics_wp"]["cosine_similarity"],
-                    "cos_both": diag["global_metrics_both"]["cosine_similarity"],
-                    "activeFracWp": diag["global_metrics_wp"]["active_frac"],
-                    "activeFracBoth": diag["global_metrics_both"]["active_frac"],
-                    "probe": diag["cosineProbe"],
-                    "wpNumCoordsUsed": wpDiagStats.get("num_coords_used", np.nan),
-                    "wpNumCoordsTotal": wpDiagStats.get("num_coords_total", np.nan),
-                    "wpNumEscalated": wpDiagStats.get("num_escalated", np.nan),
-                    "wpNumFailed": wpDiagStats.get("num_failed", np.nan),
-                })
-
-                plot_per_layer_cosine([diag], outDir, suffix=f"_step{globalStep:07d}")
-                if args.wpEstimator != "random":
-                    print(
-                        f"step={globalStep} wp={args.wpEstimator} "
-                        f"coordsUsed={wpDiagStats.get('num_coords_used', 'na')} "
-                        f"escalated={wpDiagStats.get('num_escalated', 'na')} "
-                        f"failed={wpDiagStats.get('num_failed', 'na')}"
+                    dWpDiag, _, wpLossBase, diagKeys, wpDiagStats = estimateWpAnyDirection(
+                        dual=dual,
+                        xb=xb,
+                        yb=yb,
+                        includeReturnFn=includeDiag,
+                        includeNoiseFn=(includeNoiseFn if args.wpNoiseScope == "train" else (lambda _n: True)),
+                        args=args,
                     )
-                                # raster
-                if traces is not None and args.rasterEvery > 0 and globalStep % args.rasterEvery == 0:
-                    spkList = traces.get("spk")
-                    if isinstance(spkList, (list, tuple)):
-                        for li, spk in enumerate(spkList):
-                            if not torch.is_tensor(spk):
-                                continue
-                            s = spk[0].detach().cpu()  # (T,H)
-                            s = s[:, : min(64, s.shape[1])].T
-                            ys, xs = torch.nonzero(s > 0.5, as_tuple=True)
-                            fig, ax = plt.subplots(figsize=(10, 4))
-                            ax.scatter(xs.numpy(), ys.numpy(), s=2)
-                            ax.set_xlabel("time step")
-                            ax.set_ylabel("neuron")
-                            ax.set_title(f"raster layer={li} step={globalStep}")
-                            ax.grid(True, alpha=0.2)
-                            fig.tight_layout()
-                            fig.savefig(outDir / "plots" / f"raster_step{globalStep:07d}_layer{li}.png", dpi=150, bbox_inches="tight")
-                            plt.close(fig)
 
-                # violin
-                if args.spikeViolinEvery and globalStep % args.spikeViolinEvery == 0:
-                    spikeStats = analyze_spiking_activity(dual, validLoader, device, numBatches=4)
-                    plot_spiking_activity_violin(spikeStats, outDir, depth=args.depth, step=globalStep)
+                    dSgdDiag, _, sgdLoss, traces, diagKeysSgd = computeSgdUpdateDirection(
+                        dual=dual,
+                        xb=xb,
+                        yb=yb,
+                        includeFn=includeDiag,
+                        record=(args.rasterEvery > 0 and globalStep % args.rasterEvery == 0),
+                    )
 
+                    if diagKeys != diagKeysSgd:
+                        print("warning: wp and sgd diagnostic keys differ")
+
+                    diag = cosineDiagnosticsFromDirs(dWpDiag, dSgdDiag, diagKeysSgd, device=device, 
+                                                     wpStats = wpDiagStats, zeroOnlyUsed=(args.wpEstimator == "coord_sampled"))
+                    diagForPlot = dict(diag)
+                    diagForJson = dict(diag)
+
+                    diagForJson.pop("dWP_dict", None)
+                    diagForJson.pop("dSGD_dict", None)
+                    diagForJson.pop("traces", None)
+
+                    diag.update({
+                        "step": globalStep,
+                        "epoch": epoch,
+                        "lossSgd": sgdLoss,
+                        "lossWpBase": wpLossBase,
+                        "trainMode": args.trainMode,
+                        "trainMaster": args.trainMaster if args.trainMode == "sync" else "both",
+                        "cosineProbe": args.cosineProbe if args.trainMode == "both" else "synced",
+                        "wpEstimator": args.wpEstimator,
+                        "wpStats": wpDiagStats,
+                    })
+
+                    if "wpStats" in diag:
+                        plot_wp_adaptive_suite(
+                            wp_stats=diag["wpStats"],
+                            out_dir=outDir / "plots/adaptiveWP",
+                            prefix=f"step{globalStep:07d}_",
+                        )
+
+                    cosRows.append({
+                        "step": globalStep,
+                        "epoch": epoch,
+                        "trainMode": args.trainMode,
+                        "trainMaster": args.trainMaster if args.trainMode == "sync" else "both",
+                        "wpEstimator": args.wpEstimator,
+                        "cos_all": diag["global_metrics"]["cosine_similarity"],
+                        "cos_wp": diag["global_metrics_wp"]["cosine_similarity"],
+                        "cos_both": diag["global_metrics_both"]["cosine_similarity"],
+                        "activeFracWp": diag["global_metrics_wp"]["active_frac"],
+                        "activeFracBoth": diag["global_metrics_both"]["active_frac"],
+                        "probe": diag["cosineProbe"],
+                        "wpNumCoordsUsed": wpDiagStats.get("num_coords_used", np.nan),
+                        "wpNumCoordsTotal": wpDiagStats.get("num_coords_total", np.nan),
+                        "wpNumEscalated": wpDiagStats.get("num_escalated", np.nan),
+                        "wpNumFailed": wpDiagStats.get("num_failed", np.nan),
+                    })
+
+                    plot_per_layer_cosine([diagForPlot], outDir, suffix=f"_step{globalStep:07d}")
+                    if args.nonfiringEvery > 0 and globalStep % args.nonfiringEvery == 0:
+                        nonfire = analyze_surrogate_for_nonfiring(
+                            dual,
+                            validLoader,
+                            device,
+                            num_batches=4,
+                            rare_k=2,
+                        )
+                        if nonfire:
+                            plot_nonfiring_gradient_analysis(
+                                nonfire,
+                                outDir,
+                                depth=args.depth,
+                                suffix=f"_step{globalStep:07d}",
+                            )
+                    plot_zero_gradient_analysis(
+                        diag["per_param_zero_analysis"],
+                        outDir,
+                        suffix=f"_step{globalStep:07d}_usedOnly"
+                    )
+                    if args.wpEstimator != "random":
+                        print(
+                            f"step={globalStep} wp={args.wpEstimator} "
+                            f"coordsUsed={wpDiagStats.get('num_coords_used', 'na')} "
+                            f"escalated={wpDiagStats.get('num_escalated', 'na')} "
+                            f"failed={wpDiagStats.get('num_failed', 'na')}"
+                        )
+
+                finally:
+                    if args.trainMode == "both" and wpState is not None and sgdState is not None:
+                        dual.wp.load_state_dict(wpState, strict=True)
+                        dual.sgd.load_state_dict(sgdState, strict=True)
+
+            # raster
+            if traces is not None and args.rasterEvery > 0 and globalStep % args.rasterEvery == 0:
+                spkList = traces.get("spk")
+                if isinstance(spkList, (list, tuple)):
+                    for li, spk in enumerate(spkList):
+                        if not torch.is_tensor(spk):
+                            continue
+                        s = spk[0].detach().cpu()
+                        s = s[:, : min(64, s.shape[1])].T
+                        ys, xs = torch.nonzero(s > 0.5, as_tuple=True)
+                        fig, ax = plt.subplots(figsize=(10, 4))
+                        ax.scatter(xs.numpy(), ys.numpy(), s=2)
+                        ax.set_xlabel("time step")
+                        ax.set_ylabel("neuron")
+                        ax.set_title(f"raster layer={li} step={globalStep}")
+                        ax.grid(True, alpha=0.2)
+                        fig.tight_layout()
+                        fig.savefig(outDir / "plots" / f"raster_step{globalStep:07d}_layer{li}.png", dpi=150, bbox_inches="tight")
+                        plt.close(fig)
+
+            # write diagnostic json whenever cosine probe ran
+            if diagForJson is not None:
                 with open(outDir / "data" / f"cosine_step{globalStep:07d}.json", "w", encoding="utf-8") as f:
-                    json.dump(diag, f, indent=2, default=str)
+                    json.dump(diagForJson, f, indent=2, default=str)
 
-                if args.trainMode == "both":
-                    dual.wp.load_state_dict(wpState, strict=True)
-                    dual.sgd.load_state_dict(sgdState, strict=True)
+            # violin
+            if args.spikeViolinEvery and globalStep % args.spikeViolinEvery == 0:
+                spikeStats = analyze_spiking_activity(dual, validLoader, device, num_batches=4)
+                plot_spiking_activity_violin(spikeStats, outDir, depth=args.depth)
 
             # checkpoint
             if args.ckptEvery > 0 and globalStep % args.ckptEvery == 0 and globalStep > 0:
@@ -973,34 +1255,58 @@ def main():
         with torch.no_grad():
             correctSgd = 0
             total = 0
+            validLossSumSgd = 0.0
             for xbV, ybV in validLoader:
                 xbV = xbV.to(device=device, dtype=torch.float32)
                 ybV = toLongLabels(ybV).to(device)
                 logits = dual.forward_sgd(xbV, record=False)
+                loss = F.cross_entropy(logits, ybV)
                 pred = logits.argmax(dim=1)
                 correctSgd += int((pred == ybV).sum().item())
-                total += int(ybV.numel())
+                bs = ybV.numel()
+                total += int(bs)
+                validLossSumSgd += float(loss.item()) * bs
             validAccSgd = correctSgd / max(1, total)
+            validLossSgd = validLossSumSgd / max(1, total)
 
             correctWp = 0
             totalWp = 0
+            validLossSumWp = 0.0
             for xbV, ybV in validLoader:
                 xbV = xbV.to(device=device, dtype=torch.float32)
                 ybV = toLongLabels(ybV).to(device)
                 logits = dual.wp.forward_logits(xbV, record=False)
+                loss = F.cross_entropy(logits, ybV)
                 pred = logits.argmax(dim=1)
+                bs = ybV.numel()
                 correctWp += int((pred == ybV).sum().item())
-                totalWp += int(ybV.numel())
+                totalWp += int(bs)
+                validLossSumWp += float(loss.item()) * bs
             validAccWp = correctWp / max(1, totalWp)
+            validLossWp = validLossSumWp / max(1, totalWp)
 
-        trainRows.append({"step": globalStep, "epoch": epoch, "validAccSgd": float(validAccSgd), "validAccWp": float(validAccWp), "trainMode": args.trainMode})
+        epochRows.append({
+            "epoch": epoch,
+            "stepEnd": globalStep,
+            "validAccSgd": float(validAccSgd),
+            "validLossSgd": float(validLossSgd),
+            "validAccWp": float(validAccWp),
+            "validLossWp": float(validLossWp),
+            "trainMode": args.trainMode,
+        })
 
         trainDf = pd.DataFrame(trainRows)
         cosDf = pd.DataFrame(cosRows)
+        epochDf = pd.DataFrame(epochRows)
+        
         trainDf.to_csv(outDir / "data" / "train_log.csv", index=False)
         cosDf.to_csv(outDir / "data" / "cosine_log.csv", index=False)
+        epochDf.to_csv(outDir / "data" / "epoch_log.csv", index=False)
         plotTrainingCurves(trainDf, outDir, mode=args.trainMode)
-
+        plotValidationCurves(epochDf, outDir, mode=args.trainMode)
+        plotCosineOverTime(cosDf, outDir)
+        plotActiveFractionOverTime(cosDf, outDir)
+        plotWpStepDiagnostics(trainDf, outDir)
         print(f"epoch={epoch} done. validAccSgd={validAccSgd:.4f} validAccWp={validAccWp:.4f}")
 
     print(f"done. results in {outDir}")
