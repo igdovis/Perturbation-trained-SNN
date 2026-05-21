@@ -380,7 +380,7 @@ def plot_per_layer_cosine(results, output_dir, suffix=""):
     ax2.axhline(0.0, color="black", linewidth=1)
 
     ax3.bar(x - width, w_vals_both, width, label="weight", alpha=0.8, color="coral")
-    ax3.bar(x,         b_vals_both, width, label="bias", alpha=0.8, color="lightsalmon")
+    ax3.bar(x, b_vals_both, width, label="bias", alpha=0.8, color="lightsalmon")
     ax3.bar(x + width, c_vals_both, width, label="weight + bias", alpha=0.8, color="peachpuff")
     ax3.set_ylabel("Cosine similarity", fontsize=11)
     ax3.set_title(f"WP and SGD non zero gradient {suffix}", fontsize=12)
