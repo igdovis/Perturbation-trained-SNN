@@ -186,7 +186,6 @@ def setTrainableParams(module: torch.nn.Module, includeFn: Callable[[str], bool]
 
 ########### WP ###########
 
-
 @dataclass
 class FlatMeta:
     name: str

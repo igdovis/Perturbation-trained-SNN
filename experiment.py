@@ -481,7 +481,7 @@ def plot_zero_gradient_analysis(zero_analysis, output_dir, suffix=""):
                 dpi=150, bbox_inches='tight')
     plt.close()
 
-def plot_nonfiring_gradient_analysis(analysis, output_dir, depth):
+def plot_nonfiring_gradient_analysis(analysis, output_dir, depth, suffix=""):
     if not analysis:
         return
 
@@ -513,7 +513,7 @@ def plot_nonfiring_gradient_analysis(analysis, output_dir, depth):
 
     # neuron counts
     ax2.bar(x - width, non_n, width, label='non (0 spikes)', alpha=0.8)
-    ax2.bar(x,         rare_n, width, label='rare', alpha=0.8)
+    ax2.bar(x, rare_n, width, label='rare', alpha=0.8)
     ax2.bar(x + width, fire_n, width, label='firing', alpha=0.8)
     ax2.set_xticks(x)
     ax2.set_xticklabels([f'L{l+1}' for l in layers])
@@ -523,7 +523,7 @@ def plot_nonfiring_gradient_analysis(analysis, output_dir, depth):
     ax2.legend()
 
     plt.tight_layout()
-    plt.savefig(output_dir / 'analysis' / f'nonfiring_gradients_depth{depth}.png',
+    plt.savefig(output_dir / 'analysis' / f'nonfiring_gradients_depth{depth}{suffix}.png',
                 dpi=150, bbox_inches='tight')
     plt.close()
 

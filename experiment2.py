@@ -248,6 +248,14 @@ def parse_args():
     p.add_argument("--near_delta", type=float, default=0.1)
     p.add_argument("--rare_k", type=int, default=2)
 
+
+    # post update loss prediction experiment args
+    p.add_argument("--run_post_update_prediction", action="store_true")
+    p.add_argument("--postUpdateDirections", nargs="+", type=str, default=["wp", "sg", "noise"], choices=["sg", "wp", "noise"]) 
+    p.add_argument("--postUpdateStepModes", nargs="+", type=str, default=["unit", "relative_param_norm"], choices=["raw", "unit", "relative_param_norm"])
+    p.add_argument("--postUpdateStepSizes", nargs="+", type=float, default=[1e-5, 3e-5, 1e-4, 3e-4, 1e-3])
+    p.add_argument("--postUpdateMaxBatchesPerRegime", type=int, default=2)
+
     # shortlist criteria 
     p.add_argument("--shortlist_min_frac_firing", type=float, default=0.1)
     p.add_argument("--shortlist_max_frac_firing", type=float, default=0.9)
@@ -458,22 +466,47 @@ def build_candidate_shortlist(firing_df: pd.DataFrame, args) -> pd.DataFrame:
     # categorize regimes
     conditions = []
 
+    too_silent = (
+        df["fracFiringMin"] < args.shortlist_min_frac_firing
+    ) | (
+        df["meanRateAvg"] < args.shortlist_min_mean_rate
+    )
+
+    too_unstable = (
+        df["meanRateStdAcrossLayers"] > args.shortlist_max_layer_std
+    )
+
+    too_saturated = (
+        df["fracFiringAvg"] > args.shortlist_max_frac_firing
+    )
+    
     # promising: not silent, not too unstable, not saturated
     promising_mask = (
-        df["passes_min_frac"] &
-        df["passes_min_rate"] &
-        df["passes_max_std"] &
-        df["passes_max_frac"]
+        (df["fracFiringMin"] >= 0.10)
+        & (df["meanRateAvg"] >= 1e-4)
+        & (df["meanRateAvg"] <= 0.30)
+        & (df["fracFiringAvg"] <= 0.95)
+        & (df["meanRateStdAcrossLayers"] <= 0.05)
+        & (df["nearThrAvg"] >= 0.02)
     )
 
-    # borderline: some signs of life, but not all promising conditions
-    borderline_mask = (
-        (df["passes_min_frac"] | df["passes_min_rate"]) &
-        (~promising_mask)
+    bad_silent = (
+        (df["fracFiringMin"] < 0.02)
+        | (df["meanRateAvg"] < 1e-5)
     )
 
-    # bad control: little signs of life in the network
-    bad_mask = ~promising_mask & ~borderline_mask
+    bad_saturated = (
+        (df["meanRateAvg"] > 0.40)
+        | (df["fracFiringAvg"] > 0.98)
+    )
+
+    bad_unstable = (
+        df["meanRateStdAcrossLayers"] > 0.12
+    )
+
+    bad_mask = bad_silent | bad_saturated | bad_unstable
+
+    borderline_mask = ~(promising_mask | bad_mask)
 
     df["candidate_category"] = "uncategorized"
     df.loc[promising_mask, "candidate_category"] = "promising"
@@ -737,6 +770,225 @@ def buildIncludeFn(
 
     return include
 
+def loss_on_wp_branch(model, xb, yb, device):
+    xb = xb.to(device=device, dtype=torch.float32)
+    yb = torch.as_tensor(yb, device=device)
+    if yb.dtype != torch.long:
+        yb = (yb.argmax(dim=-1) if yb.ndim > 1 else yb).long()
+    with torch.no_grad():
+        logits = model.wp.forward_logits(xb, record=False)
+        loss = F.cross_entropy(logits, yb)
+    return float(loss.item())
+
+def direction_norm(direction_dict, keys):
+    sq = 0.0
+    for k in keys:
+        if k in direction_dict:
+            sq += float((direction_dict[k].detach() ** 2).sum().item())
+    return float(np.sqrt(sq))
+
+def dot_direction(d1, d2, keys):
+    total = 0.0
+    for k in keys:
+        if k in d1 and k in d2:
+            total += float((d1[k].detach() * d2[k].detach()).sum().item())
+    return total
+
+def param_norm(model_wp, include_fn):
+    sq = 0.0
+    with torch.no_grad():
+        for name, p in model_wp.named_parameters():
+            if include_fn(name):
+                sq += float((p.detach() ** 2).sum().item())
+    return float(np.sqrt(sq))
+
+def make_random_direction_like(reference_dict):
+    return {k: torch.randn_like(v) for k, v in reference_dict.items()}    
+
+def make_delta_direction(direction_dict, keys, step_size, step_mode, param_norm_value):
+    dir_norm = direction_norm(direction_dict, keys)
+    if dir_norm <= 1e-12 or not np.isfinite(dir_norm):
+        return None, np.nan, np.nan, np.nan
+    if step_mode == "raw":
+        scale = float(step_size)
+    elif step_mode == "unit": # step size is l2 norm
+        scale = float(step_size) / dir_norm
+    elif step_mode == "relative_param_norm": # step size is norm(delta theta) / norm(theta) 
+        scale = (float(step_size) * float(param_norm_value)) / dir_norm
+    else:
+        raise ValueError(f"Invalid step mode: {step_mode}")
+    
+    delta_dict = {k: scale * direction_dict[k] for k in keys if k in direction_dict}
+    delta_norm = direction_norm(delta_dict, keys)
+    relative_delta_norm = delta_norm / max(float(param_norm_value), 1e-12)
+    return delta_dict, float(scale), float(delta_norm), float(relative_delta_norm)
+
+def apply_delta_to_wp(model, delta_dict, sign=1.0):
+    with torch.no_grad():
+        for name, p in model.wp.named_parameters():
+            if name in delta_dict:
+                p.add_(float(sign) * delta_dict[name].to(p.device))
+
+def run_post_update_prediction_for_probe(model, xb, yb, res, args, device, include_fn, h, batch_idx):
+    """
+    Compare whether SG or WP better predict the actual loss.
+    dSGD_dict and dWP_dict are update direction vectors.
+    For an applied parameter displacement delta_theta, the first-order predicted loss change is:
+            pred_delta = - <update_direction, delta_theta>
+    """
+    if "dWP_dict" not in res or "dSGD_dict" not in res:
+        return []
+    
+    dWP = res["dWP_dict"]
+    dSGD = res["dSGD_dict"]
+    keys = [k for k in dWP.keys() if k in dSGD]
+    if len(keys) == 0:
+        return []
+    
+    loss0 = loss_on_wp_branch(model, xb, yb, device)
+    param_norm_value = param_norm(model.wp, include_fn)
+    
+    directions = {"sg": dSGD, "wp": dWP, "noise": make_random_direction_like(dWP)}
+    gm = res.get("global_metrics", {})
+    gm_wp = res.get("global_metrics_wp", {})
+    gm_both = res.get("global_metrics_both", {})
+    wp_stats = res.get("wpStats", {})
+    
+    rows = []
+    for direction_name in args.postUpdateDirections:
+        direction_dict = directions[direction_name]
+        applied_dir_norm = direction_norm(direction_dict, keys)
+
+        for step_mode in args.postUpdateStepModes:
+            for step_size in args.postUpdateStepSizes:
+                delta_dict, scale, delta_norm, rel_delta_norm = make_delta_direction(
+                    direction_dict=direction_dict,
+                    keys=keys,
+                    step_size=float(step_size),
+                    step_mode=step_mode,
+                    param_norm_value=param_norm_value,
+                )
+                if delta_dict is None:
+                    continue
+
+                pred_delta_sg = -dot_direction(dSGD, delta_dict, keys)
+                pred_delta_wp = -dot_direction(dWP, delta_dict, keys)
+                pred_loss_sg = loss0 + pred_delta_sg
+                pred_loss_wp = loss0 + pred_delta_wp
+
+                apply_delta_to_wp(model, delta_dict, sign=+1.0)
+                loss_actual = loss_on_wp_branch(model, xb, yb, device)
+                apply_delta_to_wp(model, delta_dict, sign=-1.0)
+
+                actual_delta = loss_actual - loss0
+                abs_err_sg = abs(pred_loss_sg - loss_actual)
+                abs_err_wp = abs(pred_loss_wp - loss_actual)
+                sq_err_sg = (pred_loss_sg - loss_actual) ** 2
+                sq_err_wp = (pred_loss_wp - loss_actual) ** 2
+
+                rows.append({
+                    "h": float(h),
+                    "batch": int(batch_idx),
+                    "loss0": float(loss0),
+                    "directionApplied": direction_name,
+                    "stepMode": step_mode,
+                    "stepSize": float(step_size),
+                    "appliedScale": float(scale),
+                    "appliedDirectionNorm": float(applied_dir_norm),
+                    "deltaNorm": float(delta_norm),
+                    "relativeDeltaNorm": float(rel_delta_norm),
+                    "paramNorm": float(param_norm_value),
+
+                    "lossActual": float(loss_actual),
+                    "actualDelta": float(actual_delta),
+
+                    "predLossSg": float(pred_loss_sg),
+                    "predDeltaSg": float(pred_delta_sg),
+                    "absErrSg": float(abs_err_sg),
+                    "sqErrSg": float(sq_err_sg),
+                    "predImprovesSg": bool(pred_delta_sg < 0.0),
+                    "signCorrectSg": bool((pred_delta_sg < 0.0) == (actual_delta < 0.0)),
+
+                    "predLossWp": float(pred_loss_wp),
+                    "predDeltaWp": float(pred_delta_wp),
+                    "absErrWp": float(abs_err_wp),
+                    "sqErrWp": float(sq_err_wp),
+                    "predImprovesWp": bool(pred_delta_wp < 0.0),
+                    "signCorrectWp": bool((pred_delta_wp < 0.0) == (actual_delta < 0.0)),
+
+                    "betterPredictor": "sg" if abs_err_sg < abs_err_wp else ("wp" if abs_err_wp < abs_err_sg else "tie"),
+
+                    "cosine_all": to_float(gm.get("cosine_similarity", np.nan)),
+                    "cosine_wp": to_float(gm_wp.get("cosine_similarity", np.nan)),
+                    "cosine_both": to_float(gm_both.get("cosine_similarity", np.nan)),
+                    "dWP_norm": to_float(res.get("dWP_norm", np.nan)),
+                    "dSGD_norm": to_float(res.get("dSGD_norm", np.nan)),
+                    "wpProbeEstimator": args.wpProbeEstimator,
+                    "wpNumCoordsUsed": to_float(wp_stats.get("num_coords_used", np.nan)),
+                    "wpNumCoordsTotal": to_float(wp_stats.get("num_coords_total", np.nan)),
+                    "wpNumEscalated": to_float(wp_stats.get("num_escalated", np.nan)),
+                    "wpNumFailed": to_float(wp_stats.get("num_failed", np.nan)),
+                })
+    return rows
+
+
+def save_post_update_outputs(post_update_rows, out_dir):
+    if len(post_update_rows) == 0:
+        return
+
+    df = pd.DataFrame(post_update_rows)
+    df.to_csv(out_dir / "data" / "post_update_prediction.csv", index=False)
+
+    group_cols = [
+        "dataset", "depth", "threshold", "eq31_alpha", "h",
+        "directionApplied", "stepMode", "stepSize",
+    ]
+    group_cols = [c for c in group_cols if c in df.columns]
+
+    summary = (
+        df.groupby(group_cols, as_index=False)
+          .agg(
+              n=("absErrSg", "size"),
+              absErrSgMean=("absErrSg", "mean"),
+              absErrSgStd=("absErrSg", "std"),
+              absErrWpMean=("absErrWp", "mean"),
+              absErrWpStd=("absErrWp", "std"),
+              signCorrectSgMean=("signCorrectSg", "mean"),
+              signCorrectWpMean=("signCorrectWp", "mean"),
+              actualDeltaMean=("actualDelta", "mean"),
+              cosineWpMean=("cosine_wp", "mean"),
+              wpFailedMean=("wpNumFailed", "mean"),
+              wpEscalatedMean=("wpNumEscalated", "mean"),
+          )
+    )
+    summary.to_csv(out_dir / "data" / "post_update_prediction_summary.csv", index=False)
+
+    # plot mean abs error vs step size for each direction and step mode
+    for step_mode in sorted(df["stepMode"].dropna().unique()):
+        for direction_name in sorted(df["directionApplied"].dropna().unique()):
+            sub = df[(df["stepMode"] == step_mode) & (df["directionApplied"] == direction_name)]
+            if len(sub) == 0:
+                continue
+            agg = sub.groupby("stepSize", as_index=False).agg(
+                absErrSgMean=("absErrSg", "mean"),
+                absErrWpMean=("absErrWp", "mean"),
+            ).sort_values("stepSize")
+
+            fig, ax = plt.subplots(figsize=(7, 5))
+            ax.plot(agg["stepSize"], agg["absErrSgMean"], marker="o", label="sg predictor")
+            ax.plot(agg["stepSize"], agg["absErrWpMean"], marker="o", label="wp predictor")
+            ax.set_xscale("log")
+            ax.set_yscale("log")
+            ax.set_xlabel("step size")
+            ax.set_ylabel("mean absolute prediction error")
+            ax.set_title(f"post-update prediction: {direction_name}, {step_mode}")
+            ax.grid(True, alpha=0.3)
+            ax.legend()
+            plt.tight_layout()
+            fname = f"post_update_abs_error_{direction_name}_{step_mode}.png"
+            plt.savefig(out_dir / "plots" / fname, dpi=150, bbox_inches="tight")
+            plt.close()
+
 def main():
     args = parse_args()
     device, out_dir = setup(args)
@@ -831,7 +1083,8 @@ def main():
     reg_dirs = {} 
     regime_diag_rows = []
     cosine_rows = []    
-
+    post_update_rows = []
+    
     for _, row in candidate_df.iterrows():
         depth = int(row["depth"])
         if args.diagScope == "subset":
@@ -889,6 +1142,39 @@ def main():
                 gm = res.get("global_metrics", {})
                 gm_wp = res.get("global_metrics_wp", {})
                 gm_both = res.get("global_metrics_both", {})
+                
+                if args.run_post_update_prediction and bi < args.postUpdateMaxBatchesPerRegime:
+                    pu_rows = run_post_update_prediction_for_probe(
+                        model=model,
+                        xb=xb,
+                        yb=yb,
+                        res=res,
+                        args=args,
+                        device=device,
+                        include_fn=include_fn,
+                        h=h,
+                        batch_idx=bi,
+                    )
+                    for pu in pu_rows:
+                        pu.update({
+                            "tag": tag,
+                            "dataset": args.dataset,
+                            "surrogate": args.surrogate,
+                            "slope": args.slope,
+                            "eq31": int(args.eq31),
+                            "depth": depth,
+                            "threshold": thr,
+                            "eq31_alpha": alpha,
+                            "meanRateAvg": float(row["meanRateAvg"]),
+                            "meanRateStdAcrossLayers": float(row["meanRateStdAcrossLayers"]),
+                            "fracFiringMin": float(row["fracFiringMin"]),
+                            "nearThrAvg": float(row["nearThrAvg"]),
+                            "candidate_category": row.get("candidate_category", "uncategorized"),
+                            "candidate_score": float(row.get("candidate_score", np.nan)),
+                        })
+                    post_update_rows.extend(pu_rows)
+    
+                
                 if do_details:
                     reg_out, tag = make_regime_dir(out_dir, depth, thr, alpha)
                     reg_dirs[(depth, thr, alpha)] = (reg_out, tag)
@@ -1037,6 +1323,11 @@ def main():
         plot_cosine_by_candidate_category(diag_df, out_dir)
         for (d, t, a), (reg_out, tag) in reg_dirs.items():
             plot_cosine_vs_h_for_regime(cosine_df, reg_out, d, t, a, tag)
+    
+    if args.run_post_update_prediction:
+        save_post_update_outputs(post_update_rows, out_dir)
+
+    
     # aggregate over h and batches (for plotting)
     agg = cosine_df.groupby(["depth", "threshold", "eq31_alpha"], as_index=False).agg({
         "meanRateAvg": "mean",
